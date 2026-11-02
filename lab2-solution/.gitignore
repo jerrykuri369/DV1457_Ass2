@@ -1,0 +1,12 @@
+# build outputs
+project/server
+project/client/client
+project/matinvpar
+project/kmeanspar
+project/mathserver/objects/*.o
+project/mathserver/objects/*.d
+
+# files created while running
+project/mathserver/computed_results/*.txt
+project/client/results/*.txt
+tests/build/
