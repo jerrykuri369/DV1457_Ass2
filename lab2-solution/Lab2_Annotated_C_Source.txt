@@ -1,0 +1,4108 @@
+================================================================================
+ LAB 2 MATH SERVER (DV1457/DV1578) - COMPLETE C SOURCE CODE WITH COMMENTS
+================================================================================
+ Source : GitHub repository jerrykuri369/hello-world, branch main,
+          commit ad5ab24 (merge of pull request #1), folder lab2-solution/
+ Files  : 21 project files (12 .c + 9 .h), the Makefile, and 2 test-only
+          reference programs - 24 files in total.
+
+WHAT THIS FILE CONTAINS
+ - Every C source (.c) and header (.h) file of the solution, in reading order,
+   with comments explaining what each line does.
+ - The code itself is unchanged: removing the comments gives back exactly the
+   code committed on GitHub. This was checked by a script that strips all
+   comments from both versions and compares what is left.
+ - Comment style:  "// ..." at the end of a line explains that line;
+                   a block above a function explains the function as a whole.
+   Closing braces, blank lines and obvious continuation lines are not
+   commented separately.
+
+HOW TO TURN THIS FILE BACK INTO A WORKING PROJECT
+ Each file starts with a line   ===== FILE: <path> =====
+ and ends with a line           ===== END OF FILE: <path> =====
+ Everything between those two lines is the file, exactly.
+
+ On Linux (or macOS), put this .txt file in an empty folder and run:
+
+   awk '/^===== FILE: /{f=$3; d=f; sub(/\/[^\/]*$/,"",d); system("mkdir -p " d); next}
+        /^===== END OF FILE: /{close(f); f=""; next}
+        f!=""{print > f}' Lab2_Annotated_C_Source.txt
+
+ then:
+   cd lab2-solution/project
+   mkdir -p mathserver/objects mathserver/computed_results client/results
+   make
+
+ By hand: copy each block into a file with the given path. The Makefile's
+ command lines must start with a TAB character, not spaces.
+
+ Note: if you open this file in Windows Notepad and save it, keep the
+ encoding as UTF-8 and do not let an editor turn TABs into spaces.
+
+CONTENTS (line numbers refer to this .txt file; in Notepad use Ctrl+G)
+
+ PART 1 - SHARED BUILDING BLOCKS
+    1. lab2-solution/project/mathserver/include/protocol.h        line 90
+    2. lab2-solution/project/mathserver/src/protocol.c            line 167
+    3. lab2-solution/project/mathserver/include/solver.h          line 309
+    4. lab2-solution/project/mathserver/include/parallel.h        line 353
+    5. lab2-solution/project/mathserver/src/parallel.c            line 388
+
+ PART 2 - THE TWO PARALLEL SOLVERS (pthreads)
+    6. lab2-solution/project/mathserver/include/matinv_par.h      line 487
+    7. lab2-solution/project/mathserver/src/matinv-par.c          line 541
+    8. lab2-solution/project/mathserver/include/kmeans_par.h      line 914
+    9. lab2-solution/project/mathserver/src/kmeans-par.c          line 979
+
+ PART 3 - THE SERVER
+   10. lab2-solution/project/mathserver/include/server_util.h     line 1422
+   11. lab2-solution/project/mathserver/src/server_util.c         line 1464
+   12. lab2-solution/project/mathserver/include/job.h             line 1674
+   13. lab2-solution/project/mathserver/src/job.c                 line 1749
+   14. lab2-solution/project/mathserver/include/strategies.h      line 1984
+   15. lab2-solution/project/mathserver/src/server.c              line 2011
+
+ PART 4 - THE THREE STRATEGIES FOR MANY CLIENTS
+   16. lab2-solution/project/mathserver/src/strategy_fork.c       line 2170
+   17. lab2-solution/project/mathserver/include/mux.h             line 2355
+   18. lab2-solution/project/mathserver/src/mux_core.c            line 2400
+   19. lab2-solution/project/mathserver/src/strategy_muxbasic.c   line 3001
+   20. lab2-solution/project/mathserver/src/strategy_muxscale.c   line 3183
+
+ PART 5 - THE CLIENT
+   21. lab2-solution/project/client/client.c                      line 3295
+
+ PART 6 - BUILD FILE (not C, but needed to compile everything)
+   22. lab2-solution/project/Makefile                             line 3674
+
+ APPENDIX - TEST-ONLY REFERENCE PROGRAMS (not part of the submission)
+   23. lab2-solution/tests/reference/matrix_inverse.c             line 3780
+   24. lab2-solution/tests/reference/kmeans.c                     line 3965
+
+################################################################################
+# PART 1 - SHARED BUILDING BLOCKS
+################################################################################
+
+[1] lab2-solution/project/mathserver/include/protocol.h
+    About: The message format both programs use on the TCP connection: an
+           8-byte header (type + length) followed by the payload.
+
+===== FILE: lab2-solution/project/mathserver/include/protocol.h =====
+/*
+ * protocol.h
+ * ----------
+ * The message format ("wire format") used on the TCP connection between the
+ * server and the client, plus helper functions that send and receive whole
+ * messages. Both programs include this file, so they always agree on it.
+ */
+#ifndef PROTOCOL_H // include guard: if this header was already included, skip it
+#define PROTOCOL_H // ...and remember that it has now been included
+
+#include <stddef.h> // size_t: the standard type for byte counts and buffer sizes
+#include <stdint.h> // uint32_t: an unsigned integer that is exactly 32 bits wide
+
+/*
+ * Wire format shared by the server and the client.
+ *
+ * Every message is an 8-byte header (type, payload length; both in network
+ * byte order) followed by exactly `length` payload bytes.
+ *
+ *   server -> client  MSG_WELCOME    the client's number as text, e.g. "1"
+ *   client -> server  MSG_COMMAND    a command line, e.g. "matinvpar -n 8 -I fast -P 1"
+ *   server -> client  MSG_NEED_DATA  k-means only: the -f path the client must upload
+ *   client -> server  MSG_DATA       the contents of that file
+ *   client -> server  MSG_CANCEL     the client could not read that file
+ *   server -> client  MSG_RESULT     "<file name>\n<file contents>"
+ *   server -> client  MSG_INFO       text to show the user (help and usage output)
+ *   server -> client  MSG_ERROR      why a command could not be run
+ *
+ * Why a length prefix? TCP delivers a stream of bytes, not separate
+ * messages: one send() can arrive in several pieces, and two sends can
+ * arrive glued together. The length tells the receiver where a message ends.
+ */
+enum msg_type {      // the kinds of message; this number travels in the header
+    MSG_WELCOME = 1, // 1: server greets a new client and tells it its number
+    MSG_COMMAND,     // 2: client sends a command line such as "matinvpar -n 8"
+    MSG_NEED_DATA,   // 3: server asks the client to upload the k-means data file
+    MSG_DATA,        // 4: client sends the contents of that data file
+    MSG_CANCEL,      // 5: client could not read the file; the k-means job is dropped
+    MSG_RESULT,      // 6: server sends a result file as "<name>\n<contents>"
+    MSG_INFO,        // 7: server sends text to display (help or usage output)
+    MSG_ERROR        // 8: server explains why a command could not be run
+};
+
+#define MSG_HEADER_SIZE 8u                      // header = 4-byte type + 4-byte length
+#define MAX_COMMAND_LEN 4096u                   /* longest accepted command line */
+#define MAX_PAYLOAD_LEN (1024u * 1024u * 1024u) /* largest data or result payload (1 GiB) */
+
+/* Writes the 8-byte header of a message into out: the type, then the
+   length, each converted to network byte order (big-endian). */
+void encode_header(unsigned char out[MSG_HEADER_SIZE], uint32_t type, uint32_t length);
+/* Reads the type and the length back out of an 8-byte header, converting
+   them from network byte order to this machine's byte order. */
+void decode_header(const unsigned char in[MSG_HEADER_SIZE], uint32_t *type, uint32_t *length);
+
+/*
+ * Blocking helpers. They loop over partial transfers and return 0 on
+ * success, or -1 on an error or when the peer has closed the connection.
+ */
+int send_all(int fd, const void *buf, size_t len); // send exactly len bytes from buf
+int recv_all(int fd, void *buf, size_t len);       // receive exactly len bytes into buf
+int send_msg(int fd, uint32_t type, const void *payload, uint32_t length); // header + payload
+
+/*
+ * Receives one message. On success *payload is a malloc'd, NUL-terminated
+ * copy of the payload that the caller must free. Fails (and the connection
+ * should then be closed) if the payload is longer than max_length.
+ */
+int recv_msg(int fd, uint32_t *type, char **payload, uint32_t *length, uint32_t max_length);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/protocol.h =====
+
+[2] lab2-solution/project/mathserver/src/protocol.c
+    About: Sends and receives whole messages, looping over partial transfers.
+           Linked into both the server and the client.
+
+===== FILE: lab2-solution/project/mathserver/src/protocol.c =====
+/* Wire format helpers shared by the server and the client. */
+/* (Linked into both programs: the client build also uses protocol.o.) */
+#include "protocol.h" // our own declarations, checked against these definitions
+
+#include <arpa/inet.h>  // htonl()/ntohl(): convert between host and network byte order
+#include <errno.h>      // errno, EINTR, EMSGSIZE
+#include <stdlib.h>     // malloc(), free()
+#include <string.h>     // memcpy()
+#include <sys/socket.h> // send(), recv(), sendmsg(), MSG_NOSIGNAL
+#include <sys/uio.h>    // struct iovec: describes one piece of a scatter/gather send
+
+/* Fills the 8-byte header: bytes 0-3 = type, bytes 4-7 = length. */
+void encode_header(unsigned char out[MSG_HEADER_SIZE], uint32_t type, uint32_t length)
+{
+    uint32_t net_type = htonl(type);     // type in network byte order (big-endian)
+    uint32_t net_length = htonl(length); // length in network byte order
+
+    memcpy(out, &net_type, 4);       // copy the 4 type bytes to the start of the header
+    memcpy(out + 4, &net_length, 4); // copy the 4 length bytes right after them
+}
+
+/* Reverse of encode_header(): reads type and length out of the 8 bytes. */
+void decode_header(const unsigned char in[MSG_HEADER_SIZE], uint32_t *type, uint32_t *length)
+{
+    uint32_t net_type, net_length; // the raw big-endian values as they arrived
+
+    memcpy(&net_type, in, 4);       // first 4 bytes = type (memcpy avoids misaligned reads)
+    memcpy(&net_length, in + 4, 4); // next 4 bytes = length
+    *type = ntohl(net_type);        // convert to this machine's byte order
+    *length = ntohl(net_length);    // convert to this machine's byte order
+}
+
+/* send() may send fewer bytes than asked for: keep going until all are sent. */
+int send_all(int fd, const void *buf, size_t len)
+{
+    const char *p = buf; // where the unsent part begins
+
+    while (len > 0) { // repeat while bytes remain
+        // MSG_NOSIGNAL: if the other side has gone, return an error (EPIPE)
+        // instead of raising SIGPIPE, which would kill the whole program.
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0) {           // send failed
+            if (errno == EINTR) // only interrupted by a signal:
+                continue;       //   simply try again
+            return -1;          // a real error (e.g. the connection was reset)
+        }
+        p += n;            // skip over the bytes that were sent
+        len -= (size_t)n;  // fewer bytes remain
+    }
+    return 0; // everything was sent
+}
+
+/* recv() may return fewer bytes than asked for: keep going until all arrived. */
+int recv_all(int fd, void *buf, size_t len)
+{
+    char *p = buf; // where the next received bytes go
+
+    while (len > 0) { // repeat while bytes are still missing
+        ssize_t n = recv(fd, p, len, 0); // wait for at most len bytes
+        if (n == 0)
+            return -1; /* peer closed the connection */
+        if (n < 0) {           // receive failed
+            if (errno == EINTR) // only interrupted by a signal:
+                continue;       //   try again
+            return -1;          // a real error
+        }
+        p += n;           // move past the bytes we got
+        len -= (size_t)n; // fewer bytes still missing
+    }
+    return 0; // all requested bytes arrived
+}
+
+/* Sends one complete message: the 8-byte header followed by the payload. */
+int send_msg(int fd, uint32_t type, const void *payload, uint32_t length)
+{
+    unsigned char header[MSG_HEADER_SIZE]; // the 8 header bytes
+    // Two pieces sent with one system call: piece 0 is the header,
+    // piece 1 is the payload (the cast drops "const"; it is only read).
+    struct iovec iov[2] = {
+        { .iov_base = header, .iov_len = sizeof header },
+        { .iov_base = (void *)payload, .iov_len = length },
+    };
+    // Describes the list of pieces; with an empty payload send only the header.
+    struct msghdr msg = { .msg_iov = iov, .msg_iovlen = length > 0 ? 2 : 1 };
+
+    /* Header and payload go out in one call, so small messages are not
+       split into two TCP segments (which can add ~40 ms of latency). */
+    encode_header(header, type, length); // fill in the header bytes
+    while (msg.msg_iovlen > 0) {         // repeat until every piece is sent
+        ssize_t n = sendmsg(fd, &msg, MSG_NOSIGNAL); // send as much as the kernel takes
+        if (n < 0) {           // failed
+            if (errno == EINTR) // interrupted by a signal: retry
+                continue;
+            return -1;          // real error
+        }
+        // Drop the pieces that were sent completely...
+        while (msg.msg_iovlen > 0 && (size_t)n >= msg.msg_iov->iov_len) {
+            n -= (ssize_t)msg.msg_iov->iov_len; // bytes of this piece are accounted for
+            msg.msg_iov++;                      // move to the next piece
+            msg.msg_iovlen--;                   // one piece fewer left
+        }
+        // ...and trim the piece that was only partly sent.
+        if (msg.msg_iovlen > 0) {
+            msg.msg_iov->iov_base = (char *)msg.msg_iov->iov_base + n; // skip sent bytes
+            msg.msg_iov->iov_len -= (size_t)n;                         // shorter remainder
+        }
+    }
+    return 0; // the whole message was sent
+}
+
+/* Receives one complete message (header + payload) into a new buffer. */
+int recv_msg(int fd, uint32_t *type, char **payload, uint32_t *length, uint32_t max_length)
+{
+    unsigned char header[MSG_HEADER_SIZE]; // the 8 header bytes
+    char *buf;                             // will hold the payload
+
+    *payload = NULL; // so the caller never sees a stale pointer on failure
+    if (recv_all(fd, header, sizeof header) < 0) // read exactly 8 header bytes
+        return -1;                               // connection closed or broken
+    decode_header(header, type, length);         // extract type and payload length
+    if (*length > max_length) { // refuse absurd sizes (protects memory)
+        errno = EMSGSIZE;       // report "message too long"
+        return -1;
+    }
+    buf = malloc((size_t)*length + 1); // +1 for a terminating NUL character
+    if (!buf)                          // out of memory
+        return -1;
+    if (recv_all(fd, buf, *length) < 0) { // read exactly `length` payload bytes
+        free(buf);                        // give the memory back on failure
+        return -1;
+    }
+    buf[*length] = '\0'; // NUL-terminate so text payloads can be used as C strings
+    *payload = buf;      // hand the buffer to the caller (who must free it)
+    return 0;            // success
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/protocol.c =====
+
+[3] lab2-solution/project/mathserver/include/solver.h
+    About: Result codes for option parsing, and a safe text-to-integer helper
+           used by both solvers.
+
+===== FILE: lab2-solution/project/mathserver/include/solver.h =====
+/*
+ * solver.h
+ * --------
+ * Small pieces shared by the two solvers (matrix inversion and k-means):
+ * the possible results of option parsing, and a safe text-to-integer helper.
+ */
+#ifndef SOLVER_H // include guard: process this header only once
+#define SOLVER_H // mark it as processed
+
+#include <errno.h>  // errno: strtol() sets it to ERANGE when a number is too big
+#include <stdlib.h> // strtol(): converts text into a long integer
+
+/* Outcome of parsing a solver's command-line options. */
+enum parse_result {
+    PARSE_OK = 0,    /* options are valid: run the solver */
+    PARSE_INFO = 1,  /* help or usage was requested: show the message only */
+    PARSE_ERROR = -1 /* invalid options: show the message */
+};
+
+/* Parses a complete decimal integer in [min, max]. Returns 0 on success.
+   "static inline" gives every file that includes this header its own copy,
+   so no extra .c file is needed (matinv-par.c must also build on its own). */
+static inline int parse_int_arg(const char *text, long min, long max, int *out)
+{
+    char *end; // strtol() points this at the first character it did not use
+
+    // Clear errno first, so an old error is not mistaken for a new one.
+    errno = 0;
+    long value = strtol(text, &end, 10); // read the text as a base-10 number
+    // Reject: overflow (errno set), no digits at all (end == text),
+    // junk after the number (*end not the terminating NUL), or out of range.
+    if (errno != 0 || end == text || *end != '\0' || value < min || value > max)
+        return -1;     // invalid input
+    *out = (int)value; // valid: store it (it fits in an int because max does)
+    return 0;          // success
+}
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/solver.h =====
+
+[4] lab2-solution/project/mathserver/include/parallel.h
+    About: Interface for starting the solver threads.
+
+===== FILE: lab2-solution/project/mathserver/include/parallel.h =====
+/*
+ * parallel.h
+ * ----------
+ * Starting and waiting for the worker threads used by both solvers.
+ */
+#ifndef PARALLEL_H // include guard: process this header only once
+#define PARALLEL_H // mark it as processed
+
+#include <stddef.h> // size_t
+
+/*
+ * Runs fn on `count` threads and waits for all of them. Thread i receives
+ * (char *)args + i * arg_size. Threads only start working once all of them
+ * exist: if one cannot be created, the others quit without doing anything
+ * and -1 is returned, so the caller can safely retry with fewer threads.
+ * With count <= 1, fn runs in the calling thread.
+ *
+ *   count    how many threads to run
+ *   fn       the function every thread runs (the standard pthread signature)
+ *   args     an array of `count` argument structures, one per thread
+ *   arg_size the size in bytes of one element of that array
+ */
+int run_threads(int count, void *(*fn)(void *), void *args, size_t arg_size);
+
+/* Number of online CPU cores (at least 1). Used to choose how many threads. */
+int cpu_count(void);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/parallel.h =====
+
+[5] lab2-solution/project/mathserver/src/parallel.c
+    About: Starts N threads behind a 'gate' so a failed thread start can be
+           cancelled safely; counts CPU cores.
+
+===== FILE: lab2-solution/project/mathserver/src/parallel.c =====
+/* Starting and joining the worker threads used by both solvers. */
+#include "parallel.h" // our own declarations
+
+#include <pthread.h> // pthread_create(), pthread_join(), mutexes, condition variables
+#include <stdlib.h>  // malloc(), free()
+#include <unistd.h>  // sysconf(): asks the system how many CPU cores are online
+
+/* Solver threads use little stack; a small stack lets many jobs run at once. */
+#define WORKER_STACK_SIZE (256 * 1024) // 256 KiB instead of the usual 8 MiB
+
+/* Threads wait here until every thread exists, so a failed pthread_create()
+   can still cancel the run before any work has been done. */
+struct gate {
+    pthread_mutex_t lock;  // protects `state`
+    pthread_cond_t opened; // threads sleep on this until the gate opens
+    int state; /* 0 = closed, 1 = go, -1 = abort */
+};
+
+/* What one new thread needs to know. */
+struct start_info {
+    struct gate *gate;   // the shared gate to wait at
+    void *(*fn)(void *); // the real work function
+    void *arg;           // the argument for fn (this thread's own element)
+};
+
+/* Every thread starts here: wait at the gate, then run fn (or quit). */
+static void *start_when_open(void *p)
+{
+    struct start_info *info = p; // our start information
+    int go;                      // 1 if we should do the work
+
+    pthread_mutex_lock(&info->gate->lock); // take the lock before reading state
+    while (info->gate->state == 0)         // gate still closed?
+        // Sleep until signalled; the lock is released while sleeping and
+        // taken again on waking. The loop guards against spurious wake-ups.
+        pthread_cond_wait(&info->gate->opened, &info->gate->lock);
+    go = info->gate->state > 0;              // 1 = go, -1 = abort
+    pthread_mutex_unlock(&info->gate->lock); // done reading the shared state
+    return go ? info->fn(info->arg) : NULL;  // do the work, or quit without touching anything
+}
+
+int run_threads(int count, void *(*fn)(void *), void *args, size_t arg_size)
+{
+    // A fresh gate, closed (state 0), with statically initialised lock and condition.
+    struct gate gate = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0 };
+    pthread_t *threads;        // the thread handles, needed to join them
+    struct start_info *infos;  // one start_info per thread
+    pthread_attr_t attr;       // thread attributes (used to set the stack size)
+    int created = 0;           // how many threads were actually created
+
+    if (count <= 1) {  // one thread only: no need to create any
+        fn(args);      // run the work directly in the calling thread
+        return 0;
+    }
+    threads = malloc((size_t)count * sizeof *threads); // room for count handles
+    infos = malloc((size_t)count * sizeof *infos);     // room for count start_infos
+    if (threads && infos && pthread_attr_init(&attr) == 0) { // all allocations OK?
+        pthread_attr_setstacksize(&attr, WORKER_STACK_SIZE); // smaller stacks
+        for (; created < count; created++) {                 // create the threads one by one
+            // Thread i gets the gate, the work function and element i of args.
+            infos[created] = (struct start_info){
+                &gate, fn, (char *)args + (size_t)created * arg_size
+            };
+            if (pthread_create(&threads[created], &attr, start_when_open, &infos[created]) != 0)
+                break; // creation failed: stop; `created` threads exist
+        }
+        pthread_attr_destroy(&attr); // attributes no longer needed
+    }
+
+    pthread_mutex_lock(&gate.lock);              // change the gate state under the lock
+    gate.state = created == count ? 1 : -1;      // all created: go; otherwise abort
+    pthread_cond_broadcast(&gate.opened);        // wake every waiting thread
+    pthread_mutex_unlock(&gate.lock);
+
+    for (int i = 0; i < created; i++)  // wait for every created thread to finish
+        pthread_join(threads[i], NULL);
+    pthread_cond_destroy(&gate.opened); // clean up the condition variable
+    pthread_mutex_destroy(&gate.lock);  // clean up the mutex
+    free(threads);                      // free the handle array
+    free(infos);                        // free the start_info array
+    return created == count ? 0 : -1;   // 0 = the work was done, -1 = nothing was done
+}
+
+int cpu_count(void)
+{
+    long n = sysconf(_SC_NPROCESSORS_ONLN); // number of cores currently online
+    return n > 0 ? (int)n : 1;              // at least 1, even if the query failed
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/parallel.c =====
+
+
+################################################################################
+# PART 2 - THE TWO PARALLEL SOLVERS (pthreads)
+################################################################################
+
+[6] lab2-solution/project/mathserver/include/matinv_par.h
+    About: Interface of the parallel matrix inversion.
+
+===== FILE: lab2-solution/project/mathserver/include/matinv_par.h =====
+/*
+ * matinv_par.h
+ * ------------
+ * Public interface of the parallel matrix inversion (matinv-par.c).
+ */
+#ifndef MATINV_PAR_H // include guard: process this header only once
+#define MATINV_PAR_H // mark it as processed
+
+#include <stddef.h> // size_t
+#include <stdio.h>  // FILE: the report is written to a FILE stream
+
+#include "solver.h" // enum parse_result and parse_int_arg()
+
+#define MATINV_MAX_SIZE 4096 /* same limit as the sequential program */
+
+/* The options of one matrix-inversion run (filled in from -n, -m, -I, -P). */
+struct matinv_options {
+    int size;     /* -n: the matrix is size x size */
+    int maxnum;   /* -m: bound for random entries */
+    char init[8]; /* -I: "fast" or "rand" */
+    int print;    /* -P: 1 prints the inverse (standalone program) */
+};
+
+/* Parses argv (argv[0] is the command name). See enum parse_result.
+   On PARSE_INFO or PARSE_ERROR, msg receives the text to show the user. */
+int matinv_parse_options(int argc, char **argv, struct matinv_options *opts,
+                         char *msg, size_t msg_size);
+
+/*
+ * Builds the input matrix and inverts it using nthreads threads.
+ * Returns the size x size inverse (row-major, caller frees), or NULL with a
+ * message in err.
+ */
+double *matinv_compute(const struct matinv_options *opts, int nthreads,
+                       char *err, size_t err_size);
+
+/* Writes the sequential program's report; the matrix only if with_matrix. */
+void matinv_write_report(FILE *out, const struct matinv_options *opts,
+                         const double *inverse, int with_matrix);
+
+/* Server entry point: computes and writes the full report, always with the
+   matrix. Returns 0 on success, -1 with a message in err. */
+int matinv_run(const struct matinv_options *opts, int nthreads, FILE *out,
+               char *err, size_t err_size);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/matinv_par.h =====
+
+[7] lab2-solution/project/mathserver/src/matinv-par.c
+    About: Gauss-Jordan matrix inversion: rows are split between threads, two
+           barriers per pivot. Also builds as the standalone 'matinvpar'
+           program.
+
+===== FILE: lab2-solution/project/mathserver/src/matinv-par.c =====
+/*
+ * matinv-par.c - parallel matrix inversion (Gauss-Jordan elimination).
+ *
+ * Same options, matrix initialisation and report format as the sequential
+ * matrix_inverse.c from the course, and the same algorithm (no pivot
+ * search; the generated matrices are diagonally dominant).
+ *
+ * Parallel strategy: the pivot loop has to run in order, but inside one
+ * pivot step every other row can be eliminated independently. Each thread
+ * owns a contiguous block of rows; two barriers per pivot keep the threads
+ * in step:
+ *   1. thread 0 divides the pivot row by the pivot value;
+ *      barrier - nobody reads the pivot row before it is ready;
+ *   2. every thread eliminates its own rows (all except the pivot row);
+ *      barrier - nobody starts the next pivot while others still work.
+ * Every element goes through exactly the same operations, in the same
+ * order, as in the sequential program, so the results are identical.
+ *
+ * Built into the server, and on its own (with -DMATINV_STANDALONE) as the
+ * matinvpar program.
+ */
+#define _GNU_SOURCE        // enables glibc extras used here: random_r(), initstate_r()
+#include "matinv_par.h"    // our own declarations
+
+#include <limits.h>  // INT_MAX
+#include <pthread.h> // pthread_barrier_t and friends
+#include <stdint.h>  // int32_t (the type random_r() produces)
+#include <stdlib.h>  // malloc(), free(), random_r(), initstate_r()
+#include <string.h>  // strcmp(), memset()
+
+#include "parallel.h" // run_threads(), cpu_count()
+
+#define DEFAULT_SIZE 5      // -n default: a 5 x 5 matrix
+#define DEFAULT_MAXNUM 15   // -m default
+#define DEFAULT_INIT "fast" // -I default
+#define DEFAULT_PRINT 1     // -P default: print the inverse
+/* The sequential program never calls srand(), so rand() starts at seed 1.
+   random_r() with the same seed yields the same numbers, but per job. */
+#define RANDOM_SEED 1
+
+/* Element (row, col) of an n x n row-major matrix. */
+/* Row-major: row 0 first, then row 1, ...; so the index is row * n + col. */
+#define AT(m, n, row, col) ((m)[(size_t)(row) * (size_t)(n) + (size_t)(col)])
+
+/* The help text for -u (and after invalid options). Adjacent string
+   literals are joined by the compiler into one string. */
+static const char USAGE[] =
+    "Usage: matinvpar [-n problemsize]\n"
+    "           [-D] show default values\n"
+    "           [-h] help\n"
+    "           [-I init_type] fast/rand\n"
+    "           [-m maxnum] max random no\n"
+    "           [-P print_switch] 0/1";
+
+/* Everything the threads share for one inversion. */
+struct elimination {
+    int n;        // matrix size
+    int nthreads; // how many threads share the work
+    double *a;   /* input matrix, becomes the identity */
+    double *inv; /* identity, becomes the inverse */
+    pthread_barrier_t barrier; // all threads meet here twice per pivot
+};
+
+/* What each thread receives: the shared data and its own number. */
+struct worker {
+    struct elimination *e; // shared data
+    int id;                // 0 .. nthreads-1; decides which rows it owns
+};
+
+/* ------------------------------------------------------------------ */
+/* Options                                                             */
+/* ------------------------------------------------------------------ */
+
+/* Describes the accepted values of an option, for error messages. */
+static const char *expected_value(char opt)
+{
+    switch (opt) {
+    case 'n': return "a size from 1 to 4096"; // -n
+    case 'm': return "a positive integer";    // -m
+    case 'P': return "0 or 1";                // -P
+    default:  return "fast or rand";          // -I
+    }
+}
+
+/* Reads the options (same set as the sequential program) into opts. */
+int matinv_parse_options(int argc, char **argv, struct matinv_options *opts,
+                         char *msg, size_t msg_size)
+{
+    opts->size = DEFAULT_SIZE;                                // start from the defaults...
+    opts->maxnum = DEFAULT_MAXNUM;
+    snprintf(opts->init, sizeof opts->init, "%s", DEFAULT_INIT); // safe string copy
+    opts->print = DEFAULT_PRINT;                              // ...then apply the options
+
+    for (int i = 1; i < argc; i++) { // argv[0] is the command name; options start at 1
+        const char *arg = argv[i];   // the current word, e.g. "-n"
+        const char *value;           // the word after it, e.g. "8"
+        char opt;                    // the option letter, e.g. 'n'
+        int bad = 0;                 // set to 1 if the value is invalid
+
+        // An option must look like "-X": a dash, one letter, nothing more.
+        if (arg[0] != '-' || arg[1] == '\0' || arg[2] != '\0') {
+            snprintf(msg, msg_size, "Unexpected argument '%s'.\n%s", arg, USAGE);
+            return PARSE_ERROR;
+        }
+        opt = arg[1]; // the option letter
+        switch (opt) {
+        case 'h': // help: same answer as the sequential program
+            snprintf(msg, msg_size, "HELP: try matinvpar -u");
+            return PARSE_INFO;
+        case 'u': // usage: show the option list
+            snprintf(msg, msg_size, "%s", USAGE);
+            return PARSE_INFO;
+        case 'D': // show the default values
+            snprintf(msg, msg_size,
+                     "Default:  n         = %d\n"
+                     "          Init      = %s\n"
+                     "          maxnum    = %d\n"
+                     "          P         = %d",
+                     DEFAULT_SIZE, DEFAULT_INIT, DEFAULT_MAXNUM, DEFAULT_PRINT);
+            return PARSE_INFO;
+        case 'n': // these four options take a value: handled below
+        case 'I':
+        case 'm':
+        case 'P':
+            break;
+        default: // any other letter is not supported
+            snprintf(msg, msg_size, "Unknown option '%s'.\n%s", arg, USAGE);
+            return PARSE_ERROR;
+        }
+
+        if (i + 1 >= argc) { // the value is missing (the option was the last word)
+            snprintf(msg, msg_size, "Option -%c needs a value.\n%s", opt, USAGE);
+            return PARSE_ERROR;
+        }
+        value = argv[++i]; // take the next word as the value (and skip it in the loop)
+        switch (opt) {
+        case 'n': // matrix size: 1 .. 4096
+            bad = parse_int_arg(value, 1, MATINV_MAX_SIZE, &opts->size) != 0;
+            break;
+        case 'm': // maxnum: at least 1 (rand() % 0 would crash)
+            bad = parse_int_arg(value, 1, INT_MAX, &opts->maxnum) != 0;
+            break;
+        case 'P': // print switch: 0 or 1
+            bad = parse_int_arg(value, 0, 1, &opts->print) != 0;
+            break;
+        default: /* 'I' */
+            // Only "fast" and "rand" are meaningful initialisations.
+            bad = strcmp(value, "fast") != 0 && strcmp(value, "rand") != 0;
+            if (!bad)
+                snprintf(opts->init, sizeof opts->init, "%s", value); // store it
+            break;
+        }
+        if (bad) { // explain which value was wrong and what is expected
+            snprintf(msg, msg_size, "Invalid value '%s' for -%c: expected %s.",
+                     value, opt, expected_value(opt));
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK; // every option was valid
+}
+
+/* ------------------------------------------------------------------ */
+/* Computation                                                         */
+/* ------------------------------------------------------------------ */
+
+/* Same values, in the same order, as the sequential Init_Matrix(). */
+static void init_matrices(const struct matinv_options *opts, double *a, double *inv)
+{
+    int n = opts->size;                             // matrix size
+    int use_rand = strcmp(opts->init, "rand") == 0; // 1 for -I rand, 0 for -I fast
+    struct random_data rng;                         // this job's private random generator
+    char rng_state[128];                            // its state (128 bytes = same type as rand())
+
+    memset(&rng, 0, sizeof rng); // glibc requires a zeroed random_data before initstate_r()
+    initstate_r(RANDOM_SEED, rng_state, sizeof rng_state, &rng); // seed it like rand()
+
+    for (int row = 0; row < n; row++) {         // every row...
+        for (int col = 0; col < n; col++) {     // ...and every column
+            AT(inv, n, row, col) = row == col ? 1.0 : 0.0; // inv starts as the identity matrix
+            if (use_rand) {
+                int32_t r;              // the next random number
+                random_r(&rng, &r);     // same sequence as rand() in the sequential program
+                /* diagonal dominance: +5 on the diagonal, +1 elsewhere */
+                AT(a, n, row, col) = (double)(r % opts->maxnum) + (row == col ? 5.0 : 1.0);
+            } else {
+                // "fast": 5 on the diagonal, 2 everywhere else
+                AT(a, n, row, col) = row == col ? 5.0 : 2.0;
+            }
+        }
+    }
+}
+
+/* Divides pivot row p of both matrices by the pivot value. */
+static void normalise_pivot_row(struct elimination *e, int p)
+{
+    int n = e->n;                    // matrix size
+    double pivot = AT(e->a, n, p, p); // the pivot (diagonal element), read once before it changes
+
+    for (int col = 0; col < n; col++) { // every column of the pivot row
+        AT(e->a, n, p, col) /= pivot;   // in A: afterwards A[p][p] == 1
+        AT(e->inv, n, p, col) /= pivot; // the same operation on the inverse-to-be
+    }
+}
+
+/* Subtracts a multiple of pivot row p from row r so that A[r][p] becomes 0. */
+static void eliminate_row(struct elimination *e, int r, int p)
+{
+    int n = e->n;                          // matrix size
+    double multiplier = AT(e->a, n, r, p); /* read before row r changes */
+    // Direct pointers to the four rows involved. "restrict" promises the
+    // compiler that they do not overlap (true, since r != p), so it can
+    // generate faster code.
+    double *restrict a_row = &AT(e->a, n, r, 0);
+    double *restrict inv_row = &AT(e->inv, n, r, 0);
+    const double *restrict a_pivot = &AT(e->a, n, p, 0);
+    const double *restrict inv_pivot = &AT(e->inv, n, p, 0);
+
+    for (int col = 0; col < n; col++) {              // every column:
+        a_row[col] -= a_pivot[col] * multiplier;     //   row_r = row_r - m * row_p in A
+        inv_row[col] -= inv_pivot[col] * multiplier; //   and the same in the inverse
+    }
+}
+
+/* The function each thread runs: its share of all pivot steps. */
+static void *eliminate_rows(void *arg)
+{
+    struct worker *w = arg;     // this thread's worker info
+    struct elimination *e = w->e; // the shared data
+    // This thread owns rows first .. last-1: an equal block of the n rows.
+    // (long long avoids overflow in id * n for large matrices.)
+    int first = (int)((long long)w->id * e->n / e->nthreads);
+    int last = (int)((long long)(w->id + 1) * e->n / e->nthreads);
+
+    for (int p = 0; p < e->n; p++) { // pivots strictly in order 0, 1, 2, ...
+        if (w->id == 0)               // only thread 0 normalises the pivot row
+            normalise_pivot_row(e, p);
+        pthread_barrier_wait(&e->barrier); /* pivot row is ready */
+        for (int r = first; r < last; r++) // each of this thread's rows...
+            if (r != p)                    // ...except the pivot row itself
+                eliminate_row(e, r, p);
+        pthread_barrier_wait(&e->barrier); /* pivot p finished everywhere */
+    }
+    return NULL; // pthread functions return a pointer; we have nothing to return
+}
+
+/* Inverts with nthreads threads. 0 on success, -1 if threads could not start. */
+static int invert(double *a, double *inv, int n, int nthreads)
+{
+    struct elimination e = { .n = n, .nthreads = nthreads, .a = a, .inv = inv }; // shared data
+    struct worker *workers = malloc((size_t)nthreads * sizeof *workers); // one per thread
+    int rc;                                                               // result of run_threads()
+
+    if (!workers)  // out of memory
+        return -1;
+    if (pthread_barrier_init(&e.barrier, NULL, (unsigned)nthreads) != 0) { // barrier for nthreads
+        free(workers);
+        return -1;
+    }
+    for (int i = 0; i < nthreads; i++)        // give every thread its number
+        workers[i] = (struct worker){ &e, i };
+    rc = run_threads(nthreads, eliminate_rows, workers, sizeof *workers); // run and wait
+    pthread_barrier_destroy(&e.barrier); // barrier no longer needed
+    free(workers);
+    return rc;
+}
+
+double *matinv_compute(const struct matinv_options *opts, int nthreads,
+                       char *err, size_t err_size)
+{
+    size_t cells = (size_t)opts->size * (size_t)opts->size; // number of elements per matrix
+    double *a = malloc(cells * sizeof *a);                   // the input matrix A
+    double *inv = malloc(cells * sizeof *inv);               // the matrix that becomes A^-1
+
+    if (!a || !inv) { // either allocation failed
+        free(a);      // free(NULL) is harmless, so freeing both is safe
+        free(inv);
+        snprintf(err, err_size, "Not enough memory for a %dx%d matrix", opts->size, opts->size);
+        return NULL;
+    }
+    init_matrices(opts, a, inv); // fill A (fast or rand) and set inv to the identity
+
+    if (nthreads > opts->size) // more threads than rows makes no sense
+        nthreads = opts->size;
+    if (nthreads < 1)
+        nthreads = 1;
+    /* If the threads could not be started, nothing has been touched yet,
+       so falling back to a single thread is safe. */
+    if (invert(a, inv, opts->size, nthreads) != 0 && invert(a, inv, opts->size, 1) != 0) {
+        free(a);
+        free(inv);
+        snprintf(err, err_size, "Could not start the worker threads");
+        return NULL;
+    }
+    free(a);    // A is now the identity and no longer needed
+    return inv; // the caller owns the inverse and must free it
+}
+
+/* ------------------------------------------------------------------ */
+/* Output                                                              */
+/* ------------------------------------------------------------------ */
+
+/* Prints exactly what the sequential program prints (same text, same
+   spaces, same " %5.2f" number format), so results can be compared. */
+void matinv_write_report(FILE *out, const struct matinv_options *opts,
+                         const double *inverse, int with_matrix)
+{
+    int n = opts->size; // matrix size
+
+    fprintf(out, "Matrix Inverse\n");                // title line
+    fprintf(out, "\nsize      = %dx%d ", n, n);      // e.g. "size      = 8x8 "
+    fprintf(out, "\nmaxnum    = %d \n", opts->maxnum);
+    fprintf(out, "Init\t  = %s \n", opts->init);     // note: a TAB after "Init"
+    fprintf(out, "Initializing matrix...");
+    fprintf(out, "done \n\n");
+    if (!with_matrix) // header only (standalone program with -P 0)
+        return;
+
+    fprintf(out, "Inversed Matrix:\n");
+    for (int row = 0; row < n; row++) {             // every row...
+        for (int col = 0; col < n; col++)           // ...every element: width 5, 2 decimals
+            fprintf(out, " %5.2f", AT(inverse, n, row, col));
+        fputc('\n', out);                           // end of the row
+    }
+    fprintf(out, "\n\n");                           // two blank lines at the end
+}
+
+/* Used by the server: compute, then write the report including the matrix
+   (FAQ A11: results are saved to a file whatever -P says). */
+int matinv_run(const struct matinv_options *opts, int nthreads, FILE *out,
+               char *err, size_t err_size)
+{
+    double *inverse = matinv_compute(opts, nthreads, err, err_size); // do the work
+
+    if (!inverse)  // computation failed; err already explains why
+        return -1;
+    matinv_write_report(out, opts, inverse, 1); // always include the matrix
+    free(inverse);
+    if (ferror(out)) { // did any write to `out` fail?
+        snprintf(err, err_size, "Could not write the result");
+        return -1;
+    }
+    return 0;
+}
+
+/* The standalone matinvpar program (compiled only with -DMATINV_STANDALONE). */
+#ifdef MATINV_STANDALONE
+int main(int argc, char **argv)
+{
+    struct matinv_options opts; // parsed options
+    char msg[1024];             // help/error text
+    double *inverse;            // the result
+    int rc = matinv_parse_options(argc, argv, &opts, msg, sizeof msg); // read the options
+
+    if (rc != PARSE_OK) { // help (to stdout, exit 0) or error (to stderr, exit 1)
+        fprintf(rc == PARSE_INFO ? stdout : stderr, "%s\n", msg);
+        return rc == PARSE_INFO ? 0 : 1;
+    }
+    inverse = matinv_compute(&opts, cpu_count(), msg, sizeof msg); // one thread per core
+    if (!inverse) {
+        fprintf(stderr, "%s\n", msg);
+        return 1;
+    }
+    matinv_write_report(stdout, &opts, inverse, opts.print == 1); // matrix only with -P 1
+    free(inverse);
+    return 0;
+}
+#endif
+===== END OF FILE: lab2-solution/project/mathserver/src/matinv-par.c =====
+
+[8] lab2-solution/project/mathserver/include/kmeans_par.h
+    About: Interface of the parallel k-means clustering.
+
+===== FILE: lab2-solution/project/mathserver/include/kmeans_par.h =====
+/*
+ * kmeans_par.h
+ * ------------
+ * Public interface of the parallel k-means clustering (kmeans-par.c).
+ */
+#ifndef KMEANS_PAR_H // include guard: process this header only once
+#define KMEANS_PAR_H // mark it as processed
+
+#include <limits.h> // PATH_MAX: the longest file path the system allows
+#include <stddef.h> // size_t
+#include <stdio.h>  // FILE: results are written to a FILE stream
+
+#include "solver.h" // enum parse_result and parse_int_arg()
+
+#define KMEANS_DEFAULT_FILE "kmeans-data.txt"     // data file used when -f is not given
+#define KMEANS_DEFAULT_K 9                        // number of clusters when -k is not given
+#define KMEANS_RESULTS_FILE "kmeans-results.txt" /* standalone program output */
+
+/* The options of one k-means run (filled in from -f and -k). */
+struct kmeans_options {
+    char file[PATH_MAX]; /* -f: data file, one "x y" point per line */
+    int k;               /* -k: number of clusters */
+};
+
+/* One data point and the cluster it currently belongs to. */
+struct kmeans_point {
+    float x;     // x coordinate (float, as in the sequential program)
+    float y;     // y coordinate
+    int cluster; // cluster number 0..k-1, or -1 before the first assignment
+};
+
+/* The outcome of a run: every point with its cluster, and the iteration count. */
+struct kmeans_result {
+    struct kmeans_point *points; // array of all points (malloc'd)
+    int count;                   // number of points in the array
+    int iterations;              // how many iterations the algorithm took
+};
+
+/* Parses argv (argv[0] is the command name). See enum parse_result. */
+int kmeans_parse_options(int argc, char **argv, struct kmeans_options *opts,
+                         char *msg, size_t msg_size);
+
+/* Loads the data file and clusters it using nthreads threads.
+   Returns 0 on success, -1 with a message in err. */
+int kmeans_compute(const struct kmeans_options *opts, int nthreads,
+                   struct kmeans_result *result, char *err, size_t err_size);
+
+/* Writes "x y cluster" lines, the sequential program's results format. */
+void kmeans_write_results(FILE *out, const struct kmeans_result *result);
+
+/* Frees the points array inside a result. */
+void kmeans_free_result(struct kmeans_result *result);
+
+/* Server entry point: compute and write the results. 0 on success. */
+int kmeans_run(const struct kmeans_options *opts, int nthreads, FILE *out,
+               char *err, size_t err_size);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/kmeans_par.h =====
+
+[9] lab2-solution/project/mathserver/src/kmeans-par.c
+    About: k-means: parallel assignment step and parallel per-cluster update
+           step. Also builds as the standalone 'kmeanspar' program.
+
+===== FILE: lab2-solution/project/mathserver/src/kmeans-par.c =====
+/*
+ * kmeans-par.c - parallel k-means clustering.
+ *
+ * Same algorithm, initial centroids and results format as the sequential
+ * kmeans.c from the course, plus the -f (data file) and -k (clusters)
+ * options and any number of points.
+ *
+ * Parallel strategy - every iteration has two phases, each followed by a
+ * barrier:
+ *   1. assignment: each thread finds the nearest centroid for its own
+ *      contiguous slice of the points and records whether any changed;
+ *   2. update: each thread recomputes the centroids it owns (clusters
+ *      id, id + T, id + 2T, ...), scanning the points in order. The float
+ *      sums are therefore added in exactly the same order as in the
+ *      sequential program, so centroids and clusters are identical.
+ * Thread 0 also counts the iteration and decides whether to stop. Each
+ * value is written by one thread only, so no locks are needed.
+ *
+ * Built into the server, and on its own (with -DKMEANS_STANDALONE) as the
+ * kmeanspar program.
+ */
+#define _GNU_SOURCE     // enables glibc extras used here: random_r(), initstate_r()
+#include "kmeans_par.h" // our own declarations
+
+#include <float.h>   // DBL_MAX: the largest double, used as "infinitely far"
+#include <pthread.h> // pthread_barrier_t and friends
+#include <stdint.h>  // int32_t (the type random_r() produces)
+#include <stdlib.h>  // malloc(), realloc(), free(), random_r(), initstate_r()
+#include <string.h>  // strcmp(), strlen(), memcpy(), memset(), strerror()
+
+#include "parallel.h" // run_threads(), cpu_count()
+
+#define MAX_CLUSTERS 1000000 // upper limit accepted for -k
+/* The sequential program calls srand(0) before choosing the centroids. */
+#define RANDOM_SEED 0
+
+// Two-step trick that turns a macro's VALUE into a string:
+// TO_STRING(KMEANS_DEFAULT_K) first expands to TO_STRING(9), then to "9".
+#define STRINGIFY(x) #x
+#define TO_STRING(x) STRINGIFY(x)
+
+/* Help text; adjacent string literals are joined into one string. */
+static const char USAGE[] =
+    "Usage: kmeanspar [-f file] [-k clusters]\n"
+    "           [-f file]     data file, one \"x y\" point per line (default " KMEANS_DEFAULT_FILE ")\n"
+    "           [-k clusters] number of clusters (default " TO_STRING(KMEANS_DEFAULT_K) ")\n"
+    "           [-h] help";
+
+/* Everything the threads share for one clustering run. */
+struct clustering {
+    struct kmeans_point *points; // all data points
+    int n;                       // number of points
+    int k;                       // number of clusters
+    int nthreads;                // number of threads
+    float *cx, *cy;       /* centroids */
+    float *sum_x, *sum_y; /* per-cluster sums, written by the owner thread */
+    int *members;         /* points per cluster, written by the owner thread */
+    int *changed;         /* per thread: did any of its points move? */
+    int done;             /* written by thread 0 between the barriers */
+    int iterations;       // iteration counter (written by thread 0)
+    pthread_barrier_t barrier; // all threads meet here twice per iteration
+};
+
+/* What each thread receives: the shared data and its own number. */
+struct worker {
+    struct clustering *c; // shared data
+    int id;               // 0 .. nthreads-1
+};
+
+/* ------------------------------------------------------------------ */
+/* Options and input                                                   */
+/* ------------------------------------------------------------------ */
+
+int kmeans_parse_options(int argc, char **argv, struct kmeans_options *opts,
+                         char *msg, size_t msg_size)
+{
+    snprintf(opts->file, sizeof opts->file, "%s", KMEANS_DEFAULT_FILE); // default data file
+    opts->k = KMEANS_DEFAULT_K;                                         // default k = 9
+
+    for (int i = 1; i < argc; i++) { // argv[0] is the command name
+        const char *arg = argv[i];   // the current word
+        const char *value;           // the word after an option
+
+        if (strcmp(arg, "-h") == 0 || strcmp(arg, "-u") == 0) { // help requested
+            snprintf(msg, msg_size, "%s", USAGE);
+            return PARSE_INFO;
+        }
+        if (strcmp(arg, "-f") != 0 && strcmp(arg, "-k") != 0) { // anything else is unknown
+            snprintf(msg, msg_size, "Unknown option '%s'.\n%s", arg, USAGE);
+            return PARSE_ERROR;
+        }
+        if (i + 1 >= argc) { // -f or -k was the last word: value missing
+            snprintf(msg, msg_size, "Option %s needs a value.\n%s", arg, USAGE);
+            return PARSE_ERROR;
+        }
+        value = argv[++i]; // take the next word as the value
+        if (arg[1] == 'f') {                  // -f file
+            size_t len = strlen(value);       // length of the file name
+            if (len >= sizeof opts->file) {   // too long to store
+                snprintf(msg, msg_size, "The file name is too long.");
+                return PARSE_ERROR;
+            }
+            memcpy(opts->file, value, len + 1); // copy it, including the terminating NUL
+        } else if (parse_int_arg(value, 1, MAX_CLUSTERS, &opts->k) != 0) { // -k number
+            snprintf(msg, msg_size, "Invalid value '%s' for -k: expected a positive number of clusters.",
+                     value);
+            return PARSE_ERROR;
+        }
+    }
+    return PARSE_OK; // all options valid
+}
+
+/* Reads every "x y" pair from the file into a growing array. */
+static int load_points(const char *path, struct kmeans_result *result,
+                       char *err, size_t err_size)
+{
+    FILE *in = fopen(path, "r");          // open the data file for reading
+    size_t count = 0, capacity = 1024;    // points read so far / room in the array
+    struct kmeans_point *points;          // the array
+    float x, y;                           // one point as read from the file
+    int rc = 0, read_error;               // fscanf() result / did reading fail?
+
+    if (!in) { // file missing or unreadable
+        snprintf(err, err_size, "Cannot open the data file: %s", strerror(errno));
+        return -1;
+    }
+    points = malloc(capacity * sizeof *points); // start with room for 1024 points
+    // Read pairs until fscanf no longer finds two numbers (end of file or junk).
+    while (points && (rc = fscanf(in, "%f %f", &x, &y)) == 2) {
+        if (count == capacity) {               // array full: double its size
+            struct kmeans_point *grown = NULL;
+            if (capacity < (size_t)INT_MAX / 2) // keep the count within an int
+                grown = realloc(points, 2 * capacity * sizeof *points);
+            if (!grown) {        // could not grow
+                free(points);
+                points = NULL;   // signals "out of memory" below
+                break;
+            }
+            points = grown;      // use the bigger array
+            capacity *= 2;
+        }
+        points[count++] = (struct kmeans_point){ x, y, -1 }; // store it; no cluster yet (-1)
+    }
+    read_error = ferror(in); // remember whether a read error happened
+    fclose(in);              // done with the file
+
+    if (!points) { // allocation failed at some point
+        snprintf(err, err_size, "Not enough memory for the data points");
+        return -1;
+    }
+    // A clean end of file makes fscanf return EOF; anything else means a
+    // line that was not two numbers.
+    if (rc != EOF || read_error) {
+        free(points);
+        snprintf(err, err_size,
+                 "Malformed data file: expected \"x y\" pairs (stopped after %zu points)", count);
+        return -1;
+    }
+    if (count == 0) { // an empty file cannot be clustered
+        free(points);
+        snprintf(err, err_size, "The data file contains no points");
+        return -1;
+    }
+    result->points = points;     // hand the array to the result
+    result->count = (int)count;
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Clustering                                                          */
+/* ------------------------------------------------------------------ */
+
+/* Same choice as the sequential program: k random points (they may repeat). */
+static void choose_initial_centroids(struct clustering *c)
+{
+    struct random_data rng; // this run's private random generator
+    char rng_state[128];    // its state (same generator type as rand())
+
+    memset(&rng, 0, sizeof rng);                                 // required before initstate_r()
+    initstate_r(RANDOM_SEED, rng_state, sizeof rng_state, &rng); // seeded like srand(0)
+    for (int j = 0; j < c->k; j++) { // one centroid per cluster
+        int32_t r;
+        random_r(&rng, &r);              // same number rand() would give
+        c->cx[j] = c->points[r % c->n].x; // centroid j starts at a random point
+        c->cy[j] = c->points[r % c->n].y;
+    }
+}
+
+/* Returns the number of the centroid closest to point p. */
+static int nearest_centroid(const struct clustering *c, const struct kmeans_point *p)
+{
+    int nearest = 0;          // best cluster found so far
+    double min_dist = DBL_MAX; // its distance; starts "infinitely far"
+
+    for (int j = 0; j < c->k; j++) { // try every centroid
+        /* float differences widened to double, as in the sequential code */
+        double xdist = p->x - c->cx[j];
+        double ydist = p->y - c->cy[j];
+        double dist = xdist * xdist + ydist * ydist; // squared distance (no sqrt needed to compare)
+        if (dist <= min_dist) { /* "<=": ties go to the later cluster */
+            min_dist = dist;
+            nearest = j;
+        }
+    }
+    return nearest;
+}
+
+/* Phase 1 for one thread: assign points first .. last-1 to their nearest
+   centroid. Returns 1 if any of them moved to a different cluster. */
+static int assign_points(struct clustering *c, int first, int last)
+{
+    int changed = 0; // did anything move?
+
+    for (int i = first; i < last; i++) { // only this thread's slice
+        int nearest = nearest_centroid(c, &c->points[i]);
+        if (nearest != c->points[i].cluster) { // the point changes cluster
+            c->points[i].cluster = nearest;
+            changed = 1;
+        }
+    }
+    return changed;
+}
+
+/* Recomputes the centroids owned by thread `id`. */
+/* Thread id owns clusters id, id + T, id + 2T, ... (T = number of threads). */
+static void update_centroids(struct clustering *c, int id)
+{
+    for (int j = id; j < c->k; j += c->nthreads) { // reset the sums of my clusters
+        c->sum_x[j] = 0.0f;
+        c->sum_y[j] = 0.0f;
+        c->members[j] = 0;
+    }
+    for (int i = 0; i < c->n; i++) {       // scan ALL points, in order
+        int j = c->points[i].cluster;      // the point's cluster
+        if (j % c->nthreads != id)         // not one of my clusters: skip
+            continue;
+        c->sum_x[j] += c->points[i].x;     // add to the cluster's sums (float, like the original)
+        c->sum_y[j] += c->points[i].y;
+        c->members[j]++;                   // one more member
+    }
+    for (int j = id; j < c->k; j += c->nthreads) { // new centroid = average of the members
+        if (c->members[j] > 0) { /* an empty cluster keeps its centroid */
+            c->cx[j] = c->sum_x[j] / c->members[j];
+            c->cy[j] = c->sum_y[j] / c->members[j];
+        }
+    }
+}
+
+/* The function each thread runs: iterations until nothing changes. */
+static void *cluster_worker(void *arg)
+{
+    struct worker *w = arg;      // this thread's info
+    struct clustering *c = w->c; // shared data
+    // This thread's slice of points: first .. last-1.
+    int first = (int)((long long)w->id * c->n / c->nthreads);
+    int last = (int)((long long)(w->id + 1) * c->n / c->nthreads);
+
+    for (;;) { // one loop pass = one k-means iteration
+        c->changed[w->id] = assign_points(c, first, last); // phase 1; record if anything moved
+        pthread_barrier_wait(&c->barrier); /* every point has its cluster */
+
+        update_centroids(c, w->id); // phase 2: recompute my centroids
+        if (w->id == 0) {           // thread 0 also decides whether to stop
+            int any_changed = 0;
+            for (int t = 0; t < c->nthreads; t++) // did any thread see a change?
+                any_changed |= c->changed[t];
+            c->iterations++;          // count this iteration (as the original does)
+            c->done = !any_changed;   // stop when no point moved
+        }
+        pthread_barrier_wait(&c->barrier); /* centroids and 'done' are ready */
+        if (c->done)      // every thread reads the same decision
+            return NULL;  // finished
+    }
+}
+
+/* Runs the clustering with nthreads threads. 0 on success, -1 if the
+   threads could not be started (nothing has been changed in that case). */
+static int cluster(struct clustering *c, int nthreads)
+{
+    struct worker *workers = malloc((size_t)nthreads * sizeof *workers); // one per thread
+    int rc;
+
+    if (!workers)
+        return -1;
+    if (pthread_barrier_init(&c->barrier, NULL, (unsigned)nthreads) != 0) {
+        free(workers);
+        return -1;
+    }
+    c->nthreads = nthreads; // reset the shared state for this run
+    c->iterations = 0;
+    c->done = 0;
+    for (int i = 0; i < nthreads; i++)     // number the workers
+        workers[i] = (struct worker){ c, i };
+    rc = run_threads(nthreads, cluster_worker, workers, sizeof *workers); // run and wait
+    pthread_barrier_destroy(&c->barrier);
+    free(workers);
+    return rc;
+}
+
+int kmeans_compute(const struct kmeans_options *opts, int nthreads,
+                   struct kmeans_result *result, char *err, size_t err_size)
+{
+    struct clustering c = { 0 }; // shared state, all fields zero/NULL
+    int rc = -1;                 // result; stays -1 unless clustering succeeds
+
+    memset(result, 0, sizeof *result); // empty result in case of early failure
+    if (load_points(opts->file, result, err, err_size) < 0) // read the data file
+        return -1;
+    if (opts->k > result->count) { // cannot have more clusters than points
+        snprintf(err, err_size, "Cannot make %d clusters from %d points", opts->k, result->count);
+        kmeans_free_result(result);
+        return -1;
+    }
+    if (nthreads > result->count) // more threads than points makes no sense
+        nthreads = result->count;
+    if (nthreads < 1)
+        nthreads = 1;
+
+    c.points = result->points; // fill in the shared state
+    c.n = result->count;
+    c.k = opts->k;
+    // Arrays with one entry per cluster, plus one "changed" flag per thread.
+    c.cx = malloc((size_t)c.k * sizeof *c.cx);
+    c.cy = malloc((size_t)c.k * sizeof *c.cy);
+    c.sum_x = malloc((size_t)c.k * sizeof *c.sum_x);
+    c.sum_y = malloc((size_t)c.k * sizeof *c.sum_y);
+    c.members = malloc((size_t)c.k * sizeof *c.members);
+    c.changed = malloc((size_t)nthreads * sizeof *c.changed);
+
+    if (c.cx && c.cy && c.sum_x && c.sum_y && c.members && c.changed) { // all allocated?
+        choose_initial_centroids(&c);
+        /* If the threads could not be started, nothing has been touched yet. */
+        rc = cluster(&c, nthreads);
+        if (rc != 0)
+            rc = cluster(&c, 1); // fall back to a single thread
+        if (rc != 0)
+            snprintf(err, err_size, "Could not start the worker threads");
+    } else {
+        snprintf(err, err_size, "Not enough memory for %d clusters", c.k);
+    }
+
+    free(c.cx); // the helper arrays are no longer needed
+    free(c.cy);
+    free(c.sum_x);
+    free(c.sum_y);
+    free(c.members);
+    free(c.changed);
+    if (rc != 0) { // failure: free the points too
+        kmeans_free_result(result);
+        return -1;
+    }
+    result->iterations = c.iterations; // report the iteration count
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Output                                                              */
+/* ------------------------------------------------------------------ */
+
+void kmeans_write_results(FILE *out, const struct kmeans_result *result)
+{
+    for (int i = 0; i < result->count; i++) {           // one line per point
+        const struct kmeans_point *p = &result->points[i];
+        fprintf(out, "%.2f %.2f %d\n", p->x, p->y, p->cluster); // "x y cluster", 2 decimals
+    }
+}
+
+void kmeans_free_result(struct kmeans_result *result)
+{
+    free(result->points);  // free the point array
+    result->points = NULL; // avoid a dangling pointer
+    result->count = 0;
+}
+
+/* Used by the server: compute and write the results to `out`. */
+int kmeans_run(const struct kmeans_options *opts, int nthreads, FILE *out,
+               char *err, size_t err_size)
+{
+    struct kmeans_result result; // filled in by kmeans_compute()
+
+    if (kmeans_compute(opts, nthreads, &result, err, err_size) != 0)
+        return -1; // err explains why
+    kmeans_write_results(out, &result);
+    kmeans_free_result(&result);
+    if (ferror(out)) { // did writing fail?
+        snprintf(err, err_size, "Could not write the result");
+        return -1;
+    }
+    return 0;
+}
+
+/* The standalone kmeanspar program (compiled only with -DKMEANS_STANDALONE).
+   Prints the same four messages as the sequential program. */
+#ifdef KMEANS_STANDALONE
+int main(int argc, char **argv)
+{
+    struct kmeans_options opts;   // parsed options
+    struct kmeans_result result;  // the clustering
+    char msg[1024];               // help/error text
+    FILE *out;                    // the results file
+    int rc = kmeans_parse_options(argc, argv, &opts, msg, sizeof msg);
+
+    if (rc != PARSE_OK) { // help to stdout (exit 0) or error to stderr (exit 1)
+        fprintf(rc == PARSE_INFO ? stdout : stderr, "%s\n", msg);
+        return rc == PARSE_INFO ? 0 : 1;
+    }
+    if (kmeans_compute(&opts, cpu_count(), &result, msg, sizeof msg) != 0) {
+        fprintf(stderr, "%s\n", msg);
+        return 1;
+    }
+    printf("Read the problem data!\n");
+    printf("Number of iterations taken = %d\n", result.iterations);
+    printf("Computed cluster numbers successfully!\n");
+
+    out = fopen(KMEANS_RESULTS_FILE, "w"); // kmeans-results.txt in the current folder
+    if (!out) {
+        perror("Cannot open the file");
+        kmeans_free_result(&result);
+        return 1;
+    }
+    kmeans_write_results(out, &result);
+    rc = fclose(out); // fclose also reports delayed write errors
+    kmeans_free_result(&result);
+    if (rc != 0) {
+        perror("Cannot write the results");
+        return 1;
+    }
+    printf("Wrote the results to a file!\n");
+    return 0;
+}
+#endif
+===== END OF FILE: lab2-solution/project/mathserver/src/kmeans-par.c =====
+
+
+################################################################################
+# PART 3 - THE SERVER
+################################################################################
+
+[10] lab2-solution/project/mathserver/include/server_util.h
+    About: Interface of the server helpers: logging, sockets, result-file
+           paths, daemon mode.
+
+===== FILE: lab2-solution/project/mathserver/include/server_util.h =====
+/*
+ * server_util.h
+ * -------------
+ * Helpers used only by the server: logging, socket setup, the location of
+ * the computed_results folder, and daemon mode. Implemented in server_util.c.
+ */
+#ifndef SERVER_UTIL_H // include guard: process this header only once
+#define SERVER_UTIL_H // mark it as processed
+
+/* ---- logging: stdout/stderr normally, syslog once daemonised ---- */
+void log_use_syslog(void); // from now on, send log lines to syslog
+// printf-style logging; the format attribute lets gcc check the arguments
+void log_info(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+void log_error(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+/* ---- sockets ---- */
+/* Returns a socket listening on all interfaces, or -1 (error logged). */
+int open_listener(int port);
+int set_nonblocking(int fd); // make reads/writes on fd return at once instead of waiting
+
+/* ---- result files ---- */
+/* Finds <project>/mathserver/computed_results next to the executable and
+   creates it if needed. Returns 0 on success. */
+int paths_init(void);
+/* Absolute path of the computed_results folder. */
+const char *paths_results_dir(void);
+/* One more than the highest client number already used in computed_results,
+   so a restarted server never overwrites earlier files. */
+int paths_next_client_number(void);
+
+/* ---- daemon mode ---- */
+/* Forks; the parent prints the daemon's PID and exits. The child detaches
+   from the terminal and logs to syslog from then on. */
+void daemonize(int port);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/server_util.h =====
+
+[11] lab2-solution/project/mathserver/src/server_util.c
+    About: Implementation of those helpers.
+
+===== FILE: lab2-solution/project/mathserver/src/server_util.c =====
+/* Logging, sockets, result-file paths and daemon mode for the server. */
+#define _GNU_SOURCE        // enables SOCK_CLOEXEC and other GNU/Linux extras
+#include "server_util.h"   // our own declarations
+
+#include <arpa/inet.h>  // htonl(), htons(): convert to network byte order
+#include <dirent.h>     // opendir(), readdir(): list a folder
+#include <errno.h>      // errno, EEXIST
+#include <fcntl.h>      // fcntl(), open(), O_NONBLOCK, O_RDWR
+#include <limits.h>     // PATH_MAX
+#include <netinet/in.h> // struct sockaddr_in, INADDR_ANY
+#include <stdarg.h>     // va_list for the printf-style log functions
+#include <stdio.h>      // printf(), fprintf(), vsnprintf(), sscanf()
+#include <stdlib.h>     // exit()
+#include <string.h>     // strerror(), strrchr()
+#include <sys/socket.h> // socket(), bind(), listen(), setsockopt()
+#include <sys/stat.h>   // mkdir(), umask()
+#include <syslog.h>     // openlog(), syslog(): the system log used by daemons
+#include <unistd.h>     // fork(), setsid(), chdir(), dup2(), close(), readlink()
+
+/* ------------------------------------------------------------------ */
+/* Logging                                                             */
+/* ------------------------------------------------------------------ */
+
+static int use_syslog; // 0 = print to the terminal, 1 = send to syslog (daemon)
+
+void log_use_syslog(void)
+{
+    openlog("mathserver", LOG_PID, LOG_DAEMON); // tag lines "mathserver[pid]" in the system log
+    use_syslog = 1;
+}
+
+/* Common part of log_info() and log_error(). */
+static void log_line(int priority, FILE *stream, const char *fmt, va_list ap)
+{
+    char line[1024]; // the finished line
+
+    /* Format first and write once, so lines from threads do not mix. */
+    vsnprintf(line, sizeof line, fmt, ap);
+    if (use_syslog) {
+        syslog(priority, "%s", line); // daemon: to the system log
+    } else {
+        fprintf(stream, "%s\n", line); // normal: to stdout or stderr
+        fflush(stream);                // show it immediately
+    }
+}
+
+void log_info(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    log_line(LOG_INFO, stdout, fmt, ap); // information goes to stdout
+    va_end(ap);
+}
+
+void log_error(const char *fmt, ...)
+{
+    va_list ap;
+
+    va_start(ap, fmt);
+    log_line(LOG_ERR, stderr, fmt, ap); // errors go to stderr
+    va_end(ap);
+}
+
+/* ------------------------------------------------------------------ */
+/* Sockets                                                             */
+/* ------------------------------------------------------------------ */
+
+int open_listener(int port)
+{
+    struct sockaddr_in addr = { 0 }; // IPv4 address to listen on (zeroed first)
+    int one = 1;                     // "on" value for setsockopt()
+    // A TCP socket (SOCK_STREAM) for IPv4 (AF_INET); CLOEXEC = not inherited by exec'd programs.
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+    if (fd < 0) {
+        log_error("socket: %s", strerror(errno));
+        return -1;
+    }
+    /* Lets a restarted server reuse the port right away. */
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); /* reachable from other machines */
+    addr.sin_port = htons((uint16_t)port);    // the port, in network byte order
+    // bind() claims the port; listen() starts accepting connections.
+    // SOMAXCONN = the largest queue of not-yet-accepted connections allowed.
+    if (bind(fd, (struct sockaddr *)&addr, sizeof addr) < 0 || listen(fd, SOMAXCONN) < 0) {
+        log_error("Cannot listen on port %d: %s", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd; // the listening socket
+}
+
+int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0); // read the current flags
+    // add O_NONBLOCK, keeping the other flags; -1 if reading the flags failed
+    return flags < 0 ? -1 : fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+/* ------------------------------------------------------------------ */
+/* Result files                                                        */
+/* ------------------------------------------------------------------ */
+
+static char results_dir[PATH_MAX]; // absolute path of computed_results, set by paths_init()
+
+/* Creates a folder; "already exists" counts as success. */
+static int make_dir(const char *path)
+{
+    if (mkdir(path, 0755) == 0 || errno == EEXIST)
+        return 0;
+    log_error("Cannot create %s: %s", path, strerror(errno));
+    return -1;
+}
+
+int paths_init(void)
+{
+    char project[PATH_MAX];          // folder of the server executable
+    char mathserver[PATH_MAX + 16];  // <project>/mathserver
+    // /proc/self/exe is a link to this program's own file: read where it points.
+    ssize_t len = readlink("/proc/self/exe", project, sizeof project - 1);
+    char *slash;
+
+    if (len < 0) {
+        log_error("Cannot locate the server executable: %s", strerror(errno));
+        return -1;
+    }
+    project[len] = '\0';            // readlink does not add the terminating NUL
+    slash = strrchr(project, '/');  // last '/' separates folder and file name
+    if (slash)
+        *slash = '\0'; /* the server binary lives in the project folder */
+
+    snprintf(mathserver, sizeof mathserver, "%s/mathserver", project);
+    if (snprintf(results_dir, sizeof results_dir, "%s/computed_results", mathserver)
+        >= (int)sizeof results_dir) { // path did not fit
+        log_error("The project path is too long");
+        return -1;
+    }
+    // Make sure both folders exist (normally they already do).
+    return make_dir(mathserver) == 0 && make_dir(results_dir) == 0 ? 0 : -1;
+}
+
+const char *paths_results_dir(void)
+{
+    return results_dir;
+}
+
+int paths_next_client_number(void)
+{
+    DIR *dir = opendir(results_dir); // open computed_results for listing
+    struct dirent *entry;            // one folder entry
+    int highest = 0;                 // highest client number seen
+
+    if (!dir)
+        return 1; // cannot list it: start at client 1
+    while ((entry = readdir(dir)) != NULL) { // every file name
+        int number;
+        /* matches matinv_client7_soln1.txt, kmeans_client7_data2.txt, ... */
+        // %*[a-z] skips the leading letters, then "_client", then reads the number.
+        if (sscanf(entry->d_name, "%*[a-z]_client%d_", &number) == 1 && number > highest)
+            highest = number;
+    }
+    closedir(dir);
+    return highest + 1; // first number not used yet
+}
+
+/* ------------------------------------------------------------------ */
+/* Daemon mode                                                         */
+/* ------------------------------------------------------------------ */
+
+void daemonize(int port)
+{
+    pid_t pid;   // result of fork()
+    int null_fd; // descriptor of /dev/null
+
+    fflush(NULL); /* do not let the child inherit unwritten output */
+    pid = fork(); // copy this process
+    if (pid < 0) {
+        log_error("fork: %s", strerror(errno));
+        exit(1);
+    }
+    if (pid > 0) { // in the parent: report the daemon's PID and leave
+        printf("Server running as a daemon with PID %d (port %d). Stop it with: kill %d\n",
+               (int)pid, port, (int)pid);
+        exit(0); // the shell gets its prompt back
+    }
+
+    // From here on we are the child, i.e. the daemon.
+    setsid();   /* new session: no controlling terminal */
+    umask(022); // files it creates: writable only by the owner
+    if (chdir("/") < 0) { // do not keep any folder busy
+        /* not fatal: every path the server uses is absolute */
+    }
+    null_fd = open("/dev/null", O_RDWR); // /dev/null swallows everything
+    if (null_fd >= 0) {
+        dup2(null_fd, STDIN_FILENO);  // no keyboard input
+        dup2(null_fd, STDOUT_FILENO); // discard normal output
+        dup2(null_fd, STDERR_FILENO); // discard error output
+        if (null_fd > STDERR_FILENO)  // close the extra descriptor
+            close(null_fd);
+    }
+    log_use_syslog(); // log messages now go to the system log
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/server_util.c =====
+
+[12] lab2-solution/project/mathserver/include/job.h
+    About: A 'job' = one client request from parsing to reply.
+
+===== FILE: lab2-solution/project/mathserver/include/job.h =====
+/*
+ * job.h
+ * -----
+ * A "job" is one client request travelling through the server: parsed from
+ * the command text, run by a solver, saved as a result file, and turned into
+ * the reply that goes back to the client. All three strategies use this.
+ */
+#ifndef JOB_H // include guard: process this header only once
+#define JOB_H // mark it as processed
+
+#include <limits.h> // PATH_MAX
+#include <stdint.h> // uint32_t
+
+#include "kmeans_par.h" // struct kmeans_options
+#include "matinv_par.h" // struct matinv_options
+
+enum job_kind { JOB_MATINV, JOB_KMEANS }; // which of the two problems a job solves
+
+/* Per-connection counters; they give every result file a unique name. */
+struct client_info {
+    int number;           // the client's number (client1, client2, ...)
+    int matinv_solutions; // how many matrix results this client has had
+    int kmeans_solutions; // how many k-means results this client has had
+};
+
+enum job_status {
+    JOB_READY,      /* parsed: call job_execute() */
+    JOB_NEEDS_DATA, /* k-means: ask the client for kmeans.file first */
+    JOB_REPLY_ONLY  /* nothing to compute: send the INFO/ERROR reply */
+};
+
+/* One client request, from parsing to the reply that goes back. */
+struct job {
+    enum job_kind kind;           // matrix inversion or k-means
+    int client_number;            // which client asked
+    int solution_number;          // this client's Nth solution of this kind
+    struct matinv_options matinv; // options, if kind == JOB_MATINV
+    struct kmeans_options kmeans; // options, if kind == JOB_KMEANS
+    char result_name[64]; /* e.g. matinv_client1_soln2.txt */
+    uint32_t reply_type;  /* MSG_RESULT, MSG_INFO or MSG_ERROR */
+    char *reply;          /* malloc'd reply payload */
+    uint32_t reply_len;   // length of reply in bytes
+    void *owner;          /* used by the multiplexing strategies */
+    struct job *next;     /* link in the multiplexing job queue */
+};
+
+/* Parses a client command. Counts the solution when the job is accepted. */
+enum job_status job_prepare(struct job *job, const char *command,
+                            struct client_info *client);
+
+/* Undoes job_prepare() for a k-means job whose upload was cancelled. */
+void job_cancel(struct job *job, struct client_info *client);
+
+/* Saves the uploaded k-means data and points the job at the saved copy.
+   Returns 0, or -1 with an ERROR reply set. */
+int job_store_data(struct job *job, const char *data, size_t length);
+
+/* Runs the solver, saves the result file and sets a RESULT or ERROR reply.
+   Safe to call from any thread. */
+void job_execute(struct job *job);
+
+/* Replaces the reply with an error message. */
+void job_fail(struct job *job, const char *message);
+
+/* Frees the reply. */
+void job_release(struct job *job);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/job.h =====
+
+[13] lab2-solution/project/mathserver/src/job.c
+    About: Parses a command, runs the right solver, saves the result file
+           (never overwriting) and builds the reply.
+
+===== FILE: lab2-solution/project/mathserver/src/job.c =====
+/*
+ * job.c - turns a client's command into a result file and a reply.
+ * Used by every strategy; job_execute() is thread-safe.
+ */
+#define _GNU_SOURCE // enables vasprintf() and open_memstream()
+#include "job.h"    // our own declarations
+
+#include <errno.h>  // errno, EINTR, ENAMETOOLONG
+#include <fcntl.h>  // open() and its O_* flags
+#include <stdarg.h> // va_list: functions with a variable number of arguments
+#include <stdio.h>  // snprintf(), fprintf(), open_memstream(), vasprintf()
+#include <stdlib.h> // free()
+#include <string.h> // strlen(), strcmp(), strtok_r(), memset(), strerror()
+#include <unistd.h> // write(), close(), unlink()
+
+#include "parallel.h"    // cpu_count()
+#include "protocol.h"    // MSG_* types, MAX_COMMAND_LEN, MAX_PAYLOAD_LEN
+#include "server_util.h" // paths_results_dir()
+
+#define MAX_ARGS 64 // most words accepted in one command
+
+/* Declaration with the printf-format attribute, so gcc checks the arguments. */
+static enum job_status set_reply(struct job *job, uint32_t type, const char *fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+
+/* Sets the job's reply to a formatted text of the given type. Always returns
+   JOB_REPLY_ONLY, so callers can write "return set_reply(...)". */
+static enum job_status set_reply(struct job *job, uint32_t type, const char *fmt, ...)
+{
+    va_list ap; // the extra arguments
+    int len;    // length of the formatted text
+
+    free(job->reply);                       // drop any previous reply
+    va_start(ap, fmt);                      // start reading the extra arguments
+    len = vasprintf(&job->reply, fmt, ap);  // format into a newly allocated string
+    va_end(ap);                             // done with the arguments
+    if (len < 0) {        // formatting/allocation failed
+        job->reply = NULL;
+        len = 0;          // send an empty reply rather than crash
+    }
+    job->reply_type = type;
+    job->reply_len = (uint32_t)len;
+    return JOB_REPLY_ONLY;
+}
+
+void job_fail(struct job *job, const char *message)
+{
+    set_reply(job, MSG_ERROR, "%s", message); // "%s" so a '%' in message is printed literally
+}
+
+void job_release(struct job *job)
+{
+    free(job->reply);  // free the reply text
+    job->reply = NULL; // and forget it, so a second release is harmless
+    job->reply_len = 0;
+}
+
+/* Splits line in place into words. Returns the count, or -1 if too many. */
+static int split_words(char *line, char **argv, int max)
+{
+    int argc = 0;        // words found so far
+    char *save = NULL;   // strtok_r()'s position (thread-safe, unlike strtok())
+
+    // strtok_r replaces separators with '\0' and returns one word at a time.
+    for (char *word = strtok_r(line, " \t\r\n", &save); word; word = strtok_r(NULL, " \t\r\n", &save)) {
+        if (argc == max) // too many words
+            return -1;
+        argv[argc++] = word; // remember where the word starts
+    }
+    argv[argc] = NULL; // argv lists end with NULL, like main()'s argv
+    return argc;
+}
+
+/* True if word is the command's name or its alias. */
+static int is_command(const char *word, const char *name, const char *alias)
+{
+    return strcmp(word, name) == 0 || strcmp(word, alias) == 0;
+}
+
+enum job_status job_prepare(struct job *job, const char *command, struct client_info *client)
+{
+    char line[MAX_COMMAND_LEN + 1]; // a writable copy of the command (split_words changes it)
+    char *argv[MAX_ARGS + 1];       // the words, plus the closing NULL
+    char message[1024];             // help/error text from the option parsers
+    int argc, rc;
+
+    memset(job, 0, sizeof *job);              // start from an empty job
+    job->client_number = client->number;
+    snprintf(line, sizeof line, "%s", command); // copy (safely truncated if too long)
+
+    argc = split_words(line, argv, MAX_ARGS); // split into words
+    if (argc < 0)
+        return set_reply(job, MSG_ERROR, "Too many arguments (at most %d).", MAX_ARGS - 1);
+    if (argc == 0)
+        return set_reply(job, MSG_ERROR, "Empty command.");
+
+    if (is_command(argv[0], "matinvpar", "matinv-par")) {  // matrix inversion
+        job->kind = JOB_MATINV;
+        rc = matinv_parse_options(argc, argv, &job->matinv, message, sizeof message);
+        if (rc != PARSE_OK) // help text or an error: reply with it, nothing to compute
+            return set_reply(job, rc == PARSE_INFO ? MSG_INFO : MSG_ERROR, "%s", message);
+        job->solution_number = ++client->matinv_solutions; // this client's next matrix solution
+        // Result name as in the handout, e.g. matinv_client1_soln2.txt
+        snprintf(job->result_name, sizeof job->result_name, "matinv_client%d_soln%d.txt",
+                 client->number, job->solution_number);
+        return JOB_READY;
+    }
+    if (is_command(argv[0], "kmeanspar", "kmeans-par")) {  // k-means
+        job->kind = JOB_KMEANS;
+        rc = kmeans_parse_options(argc, argv, &job->kmeans, message, sizeof message);
+        if (rc != PARSE_OK)
+            return set_reply(job, rc == PARSE_INFO ? MSG_INFO : MSG_ERROR, "%s", message);
+        job->solution_number = ++client->kmeans_solutions; // separate counter for k-means
+        snprintf(job->result_name, sizeof job->result_name, "kmeans_client%d_soln%d.txt",
+                 client->number, job->solution_number);
+        return JOB_NEEDS_DATA; /* the data file is on the client's machine */
+    }
+    // Neither command: tell the user what exists.
+    return set_reply(job, MSG_ERROR,
+                     "Unknown command '%s'. Available commands: matinvpar, kmeanspar.", argv[0]);
+}
+
+void job_cancel(struct job *job, struct client_info *client)
+{
+    if (job->kind == JOB_KMEANS)    // give the solution number back,
+        client->kmeans_solutions--; // so no number is skipped
+    else
+        client->matinv_solutions--;
+    job_release(job);
+}
+
+/* Creates `name` in computed_results (never replacing a file) and writes data. */
+static int write_new_file(const char *name, const char *data, size_t length,
+                          char *path, size_t path_size)
+{
+    int fd, saved_errno; // file descriptor / errno kept across clean-up calls
+    size_t done = 0;     // bytes written so far
+
+    // Build the full path; snprintf returns the length it needed.
+    if (snprintf(path, path_size, "%s/%s", paths_results_dir(), name) >= (int)path_size) {
+        errno = ENAMETOOLONG; // did not fit
+        return -1;
+    }
+    // O_EXCL: fail if the file already exists - results are never overwritten.
+    fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+    if (fd < 0)
+        return -1;
+    while (done < length) { // write() may write less than asked: loop
+        ssize_t n = write(fd, data + done, length - done);
+        if (n < 0) {
+            if (errno == EINTR) // interrupted by a signal: retry
+                continue;
+            break;              // real error: stop (done < length)
+        }
+        done += (size_t)n;
+    }
+    saved_errno = errno; // close() could overwrite errno
+    if (close(fd) != 0 && done == length) { // close can report a delayed write error
+        saved_errno = errno;
+        done = 0; // treat as failed
+    }
+    if (done != length) { // incomplete file: delete it
+        unlink(path);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
+}
+
+int job_store_data(struct job *job, const char *data, size_t length)
+{
+    char name[64]; // e.g. kmeans_client1_data1.txt
+
+    snprintf(name, sizeof name, "kmeans_client%d_data%d.txt", job->client_number, job->solution_number);
+    // Save the upload; the full path is written straight into job->kmeans.file,
+    // so the solver reads the server's copy instead of the client's path.
+    if (write_new_file(name, data, length, job->kmeans.file, sizeof job->kmeans.file) < 0) {
+        set_reply(job, MSG_ERROR, "Could not store the data file: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+void job_execute(struct job *job)
+{
+    char err[512] = "";      // error text from the solver
+    char path[PATH_MAX];     // full path of the result file
+    char *text = NULL;       // memory buffer that the result is written into
+    size_t text_len = 0;     // its length
+    size_t name_len = strlen(job->result_name) + 1; /* name and '\n' */
+    // A FILE that writes into memory: the solvers write to it like to a file.
+    FILE *mem = open_memstream(&text, &text_len);
+    int rc; // solver result
+
+    if (!mem) {
+        job_fail(job, "The server is out of memory.");
+        return;
+    }
+    /* The reply payload is "<name>\n<contents>"; build it in one buffer. */
+    fprintf(mem, "%s\n", job->result_name); // first line: the file name
+    if (job->kind == JOB_MATINV)            // run the right solver, one thread per core
+        rc = matinv_run(&job->matinv, cpu_count(), mem, err, sizeof err);
+    else
+        rc = kmeans_run(&job->kmeans, cpu_count(), mem, err, sizeof err);
+    if (fclose(mem) != 0 && rc == 0) { // closing finalises text/text_len
+        rc = -1;
+        snprintf(err, sizeof err, "The server is out of memory.");
+    }
+    if (rc == 0 && text_len > MAX_PAYLOAD_LEN) { // too big for one message
+        rc = -1;
+        snprintf(err, sizeof err, "The result is too large to send.");
+    }
+    // Save the contents (everything after the name line) in computed_results.
+    if (rc == 0 && write_new_file(job->result_name, text + name_len, text_len - name_len,
+                                  path, sizeof path) < 0) {
+        rc = -1;
+        snprintf(err, sizeof err, "Could not save %s: %s", job->result_name, strerror(errno));
+    }
+    if (rc != 0) { // any failure: reply with the error instead
+        free(text);
+        job_fail(job, err);
+        return;
+    }
+    free(job->reply);                   // (normally NULL here)
+    job->reply = text;                  // the buffer becomes the reply payload, no copy
+    job->reply_len = (uint32_t)text_len;
+    job->reply_type = MSG_RESULT;
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/job.c =====
+
+[14] lab2-solution/project/mathserver/include/strategies.h
+    About: The three ways to serve many clients (-s fork | muxbasic |
+           muxscale).
+
+===== FILE: lab2-solution/project/mathserver/include/strategies.h =====
+/*
+ * strategies.h
+ * ------------
+ * The three ways the server can serve many clients at the same time
+ * (chosen with -s on the command line).
+ */
+#ifndef STRATEGIES_H // include guard: process this header only once
+#define STRATEGIES_H // mark it as processed
+
+/* Each function serves clients on listen_fd until the process is stopped.
+   Client numbers start at first_client_number. They return only on a fatal
+   error, with the exit status to use. */
+/*   -s fork      one process per client         (strategy_fork.c)
+     -s muxbasic  one process, waits with poll()  (strategy_muxbasic.c)
+     -s muxscale  one process, waits with epoll   (strategy_muxscale.c) */
+int run_fork_strategy(int listen_fd, int first_client_number);
+int run_muxbasic_strategy(int listen_fd, int first_client_number);
+int run_muxscale_strategy(int listen_fd, int first_client_number);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/strategies.h =====
+
+[15] lab2-solution/project/mathserver/src/server.c
+    About: main(): reads -h -p -d -s (exit code 3 for unsupported options),
+           opens the port, optionally becomes a daemon, starts the strategy.
+
+===== FILE: lab2-solution/project/mathserver/src/server.c =====
+/*
+ * server.c - entry point of the math server.
+ *
+ *   ./server [-h] [-p port] [-d] [-s fork|muxbasic|muxscale]
+ *
+ * Opens the listening socket, optionally becomes a daemon, then serves
+ * clients with the chosen strategy until it is stopped (Ctrl+C, or kill
+ * for a daemon). Unsupported options make it print the usage and exit 3.
+ */
+#define _GNU_SOURCE        // GNU/Linux extras
+#include <signal.h>        // signal(), SIGPIPE, SIG_IGN
+#include <stdio.h>         // printf(), fprintf(), setvbuf()
+#include <stdlib.h>        // general utilities
+#include <string.h>        // strcmp()
+#include <sys/resource.h>  // getrlimit(), setrlimit(): per-process limits
+#include <unistd.h>        // getopt(), optarg, optind, opterr, optopt
+
+#include "server_util.h" // logging, paths, listener, daemonize()
+#include "solver.h"      // parse_int_arg()
+#include "strategies.h"  // the three run_*_strategy() functions
+
+#define DEFAULT_PORT 9999  // used when -p is not given
+#define EXIT_BAD_OPTION 3  // exit code for unsupported options (required by the handout)
+
+enum strategy { STRATEGY_FORK, STRATEGY_MUXBASIC, STRATEGY_MUXSCALE }; // the -s choices
+
+// Names accepted after -s; the index matches enum strategy.
+static const char *const STRATEGY_NAMES[] = { "fork", "muxbasic", "muxscale" };
+
+/* Prints the help text to out (stdout for -h, stderr after an error). */
+static void usage(FILE *out, const char *program)
+{
+    fprintf(out,
+            "Usage: %s [-h] [-p port] [-d] [-s strategy]\n"
+            "  -h           print this help text\n"
+            "  -p port      listen on this port (default %d)\n"
+            "  -d           run as a daemon (prints its process ID)\n"
+            "  -s strategy  how to serve many clients at once:\n"
+            "               fork      one process per client (default)\n"
+            "               muxbasic  one process, poll()\n"
+            "               muxscale  one process, epoll()\n",
+            program, DEFAULT_PORT);
+}
+
+/* Looks up a strategy name. 0 and *out set if found, -1 otherwise. */
+static int parse_strategy(const char *name, enum strategy *out)
+{
+    // sizeof array / sizeof one element = number of names
+    for (size_t i = 0; i < sizeof STRATEGY_NAMES / sizeof STRATEGY_NAMES[0]; i++) {
+        if (strcmp(name, STRATEGY_NAMES[i]) == 0) {
+            *out = (enum strategy)i;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+/* The mux strategies may hold thousands of sockets: allow as many
+   descriptors as the system lets this process have. */
+static void raise_descriptor_limit(void)
+{
+    struct rlimit limit; // rlim_cur = current limit, rlim_max = highest allowed
+
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur < limit.rlim_max) {
+        limit.rlim_cur = limit.rlim_max; // raise the soft limit to the hard limit
+        setrlimit(RLIMIT_NOFILE, &limit);
+    }
+}
+
+/* Prints an error and the usage, and returns exit code 3. `message` is a
+   printf format with one %s that receives `value`. */
+static int bad_option(const char *program, const char *message, const char *value)
+{
+    fprintf(stderr, message, value);
+    fputc('\n', stderr);
+    usage(stderr, program);
+    return EXIT_BAD_OPTION;
+}
+
+int main(int argc, char **argv)
+{
+    int port = DEFAULT_PORT;                // -p
+    int run_as_daemon = 0;                  // -d
+    enum strategy strategy = STRATEGY_FORK; // -s (default fork)
+    int first_client_number, listen_fd, opt;
+    char optstr[2] = { 0 }; // the offending option letter as a 1-character string
+
+    setvbuf(stdout, NULL, _IOLBF, 0); // line-buffered stdout: each log line appears at once
+    opterr = 0; /* we print our own messages */
+    // ":hp:ds:" = options h, p (needs a value), d, s (needs a value). The
+    // leading ':' makes getopt return ':' when a value is missing.
+    while ((opt = getopt(argc, argv, ":hp:ds:")) != -1) {
+        optstr[0] = (char)optopt; // the letter getopt was looking at
+        switch (opt) {
+        case 'h': // help
+            usage(stdout, argv[0]);
+            return 0;
+        case 'p': // port: 1 .. 65535
+            if (parse_int_arg(optarg, 1, 65535, &port) != 0)
+                return bad_option(argv[0], "Invalid port '%s'.", optarg);
+            break;
+        case 'd': // daemon mode
+            run_as_daemon = 1;
+            break;
+        case 's': // strategy
+            if (parse_strategy(optarg, &strategy) != 0)
+                return bad_option(argv[0], "Unsupported strategy '%s'.", optarg);
+            break;
+        case ':': // -p or -s without a value
+            return bad_option(argv[0], "Option -%s needs a value.", optstr);
+        default:  // '?': an unknown option
+            return bad_option(argv[0], "Unsupported option -%s.", optstr);
+        }
+    }
+    /* Also accept a bare port ("./server 9999"), as in one handout example. */
+    if (optind == argc - 1) {            // exactly one extra word: try it as a port
+        if (parse_int_arg(argv[optind], 1, 65535, &port) != 0)
+            return bad_option(argv[0], "Unsupported argument '%s'.", argv[optind]);
+    } else if (optind < argc) {          // more extra words: not supported
+        return bad_option(argv[0], "Unsupported argument '%s'.", argv[optind]);
+    }
+
+    signal(SIGPIPE, SIG_IGN); /* a vanished client must not kill the server */
+    raise_descriptor_limit();
+    if (paths_init() < 0)     // find/create mathserver/computed_results
+        return 1;
+    first_client_number = paths_next_client_number(); // continue numbering after a restart
+
+    /* Open the port before daemonising, so errors still reach the terminal. */
+    listen_fd = open_listener(port);
+    if (listen_fd < 0)
+        return 1;
+    if (run_as_daemon)
+        daemonize(port); // the parent prints the PID and exits inside this call
+
+    log_info("Math server on port %d, strategy %s, results in %s",
+             port, STRATEGY_NAMES[strategy], paths_results_dir());
+    log_info("Listening for clients..."); // the line shown in the handout
+    switch (strategy) { // serve clients until stopped
+    case STRATEGY_MUXBASIC:
+        return run_muxbasic_strategy(listen_fd, first_client_number);
+    case STRATEGY_MUXSCALE:
+        return run_muxscale_strategy(listen_fd, first_client_number);
+    default:
+        return run_fork_strategy(listen_fd, first_client_number);
+    }
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/server.c =====
+
+
+################################################################################
+# PART 4 - THE THREE STRATEGIES FOR MANY CLIENTS
+################################################################################
+
+[16] lab2-solution/project/mathserver/src/strategy_fork.c
+    About: fork: one child process per client; a SIGCHLD handler reaps
+           finished children so no zombies remain.
+
+===== FILE: lab2-solution/project/mathserver/src/strategy_fork.c =====
+/*
+ * strategy_fork.c - one child process per client.
+ *
+ * The parent only accepts connections. Each child serves one client with
+ * plain blocking I/O and exits when the client leaves. A SIGCHLD handler
+ * reaps finished children, so no zombies are left behind.
+ */
+#define _GNU_SOURCE        // GNU/Linux extras (e.g. SA_RESTART definitions)
+#include "strategies.h"    // our own declaration
+
+#include <errno.h>      // errno, EINTR, ECONNABORTED
+#include <signal.h>     // sigaction(), SIGCHLD
+#include <stdio.h>      // snprintf(), fflush()
+#include <stdlib.h>     // free()
+#include <string.h>     // strlen(), memset(), strerror()
+#include <sys/socket.h> // accept()
+#include <sys/wait.h>   // waitpid(), WNOHANG
+#include <unistd.h>     // fork(), close(), _exit(), usleep()
+
+#include "job.h"         // job_prepare(), job_execute(), ...
+#include "protocol.h"    // send_msg(), recv_msg(), MSG_*
+#include "server_util.h" // log_info(), log_error()
+
+/* Runs when a child process ends: collects its exit status (reaps it). */
+static void reap_children(int sig)
+{
+    int saved_errno = errno; /* waitpid() may change errno */
+
+    (void)sig; // the parameter is not needed (this silences "unused" warnings)
+    /* One SIGCHLD can stand for several finished children: reap them all. */
+    // WNOHANG: return immediately when no more children have finished.
+    while (waitpid(-1, NULL, WNOHANG) > 0) {
+    }
+    errno = saved_errno; // restore errno for the code that was interrupted
+}
+
+/* Installs reap_children() as the SIGCHLD handler. */
+static int install_child_reaper(void)
+{
+    struct sigaction sa; // describes how to handle the signal
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = reap_children; // the function to run
+    sigemptyset(&sa.sa_mask);      // block no extra signals while it runs
+    sa.sa_flags = SA_RESTART | SA_NOCLDSTOP; /* accept() resumes after the signal */
+    // (SA_NOCLDSTOP: no signal when a child is only stopped, just when it ends.)
+    return sigaction(SIGCHLD, &sa, NULL);
+}
+
+/* Sends a text message of the given type. */
+static int send_text(int fd, uint32_t type, const char *text)
+{
+    return send_msg(fd, type, text, (uint32_t)strlen(text));
+}
+
+/* For a k-means job: asks for the data file and stores it.
+   Returns 1 when the job can run, 0 when it ended without a result, and
+   -1 when the connection broke. */
+static int receive_data(int fd, struct job *job, struct client_info *client)
+{
+    uint32_t type, length; // of the client's answer
+    char *data;            // its payload
+    int rc;                // what to return
+
+    if (send_text(fd, MSG_NEED_DATA, job->kmeans.file) < 0) // "please send <file>"
+        return -1;
+    if (recv_msg(fd, &type, &data, &length, MAX_PAYLOAD_LEN) < 0) // wait for the answer
+        return -1;
+    if (type == MSG_CANCEL) {            // the client could not read the file
+        log_info("Client %d cancelled the upload", client->number);
+        job_cancel(job, client);
+        rc = 0;
+    } else if (type != MSG_DATA) {       // protocol error: something unexpected
+        job_fail(job, "Expected the data file.");
+        rc = send_msg(fd, job->reply_type, job->reply, job->reply_len) < 0 ? -1 : 0;
+        job_release(job);
+    } else if (job_store_data(job, data, length) < 0) { // could not save the upload
+        rc = send_msg(fd, job->reply_type, job->reply, job->reply_len) < 0 ? -1 : 0;
+        job_release(job);
+    } else {                             // upload saved: the job can run
+        log_info("Received the data file from client %d (%u bytes)", client->number, length);
+        rc = 1;
+    }
+    free(data); // the payload was copied to disk (or not needed)
+    return rc;
+}
+
+/* Runs one command. Returns -1 when the connection is no longer usable. */
+static int handle_command(int fd, struct client_info *client, const char *command)
+{
+    struct job job;          // the request being handled
+    enum job_status status;  // what job_prepare() decided
+    int rc;
+
+    log_info("Client %d commanded: %s", client->number, command); // as in the handout
+    status = job_prepare(&job, command, client);
+    if (status == JOB_NEEDS_DATA) {         // k-means: fetch the data file first
+        rc = receive_data(fd, &job, client);
+        if (rc <= 0)    // cancelled (0) or broken connection (-1)
+            return rc;
+        status = JOB_READY;
+    }
+    if (status == JOB_READY)  // compute (in this child, using solver threads)
+        job_execute(&job);
+    if (job.reply_type == MSG_RESULT)
+        log_info("Sending solution: %s", job.result_name);
+    rc = send_msg(fd, job.reply_type, job.reply, job.reply_len); // result, info or error
+    job_release(&job);
+    return rc;
+}
+
+/* The whole life of one connection, inside its child process. */
+static void serve_client(int fd, int number)
+{
+    struct client_info client = { .number = number }; // counters start at 0
+    char welcome[16];                                 // the client number as text
+
+    snprintf(welcome, sizeof welcome, "%d", number);
+    if (send_text(fd, MSG_WELCOME, welcome) == 0) { // greet the client
+        for (;;) { // one loop pass per command
+            uint32_t type, length;
+            char *payload;
+            int rc;
+
+            if (recv_msg(fd, &type, &payload, &length, MAX_COMMAND_LEN) < 0)
+                break; /* client left, or sent something unacceptable */
+            if (type == MSG_COMMAND)
+                rc = handle_command(fd, &client, payload);
+            else
+                rc = send_text(fd, MSG_ERROR, "Expected a command.");
+            free(payload);
+            if (rc < 0)  // connection broken: stop serving
+                break;
+        }
+    }
+    log_info("Client %d disconnected", number);
+}
+
+int run_fork_strategy(int listen_fd, int first_client_number)
+{
+    int next_number = first_client_number; // number for the next client
+
+    if (install_child_reaper() < 0) { // without it, finished children would become zombies
+        log_error("sigaction: %s", strerror(errno));
+        return 1;
+    }
+    for (;;) { // the server runs until it is stopped (Ctrl+C or kill)
+        int fd = accept(listen_fd, NULL, NULL); // wait for the next connection
+        int number;
+        pid_t pid;
+
+        if (fd < 0) {
+            if (errno == EINTR || errno == ECONNABORTED) // harmless: try again
+                continue;
+            log_error("accept: %s", strerror(errno));
+            usleep(100 * 1000); /* e.g. out of descriptors: do not spin */
+            continue;
+        }
+
+        number = next_number++; // the parent hands out numbers, so they never clash
+        log_info("Connected with client %d", number);
+        fflush(NULL); /* otherwise buffered output would be printed twice */
+        pid = fork(); // create the child that will serve this client
+        if (pid < 0) {  // fork failed (e.g. process limit reached)
+            log_error("fork: %s", strerror(errno));
+            send_text(fd, MSG_ERROR, "The server is overloaded, please try again later.");
+            close(fd);
+            continue;
+        }
+        if (pid == 0) {          // in the child:
+            close(listen_fd);    //   it does not accept connections
+            serve_client(fd, number);
+            close(fd);
+            _exit(0);            //   end the child (never return to the accept loop)
+        }
+        close(fd); /* the child owns the connection now */
+    }
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/strategy_fork.c =====
+
+[17] lab2-solution/project/mathserver/include/mux.h
+    About: Interface between the shared multiplexing core and its two back
+           ends (poll and epoll).
+
+===== FILE: lab2-solution/project/mathserver/include/mux.h =====
+#ifndef MUX_H // include guard: process this header only once
+#define MUX_H // mark it as processed
+
+/*
+ * Core shared by the two multiplexing strategies (muxbasic = poll,
+ * muxscale = epoll). The core owns all client state and protocol logic;
+ * a backend only tells it which descriptors are ready.
+ */
+
+#define MUX_READ 1u  // bit flag: "readable" (wanted, or ready)
+#define MUX_WRITE 2u // bit flag: "writable" (wanted, or ready)
+#define MUX_ERROR 4u // bit flag: an error or hang-up happened on the descriptor
+
+/* Functions a backend provides so the core can change what is watched.
+   A "tag" is a pointer the backend hands back with every event, so the
+   core knows which client (or the listener, or the job pipe) is ready. */
+struct mux_backend {
+    void *impl; // the backend's own data (the poll set or the epoll descriptor)
+    int (*add)(void *impl, int fd, void *tag, unsigned interest);    // start watching fd
+    int (*modify)(void *impl, int fd, void *tag, unsigned interest); // change what we wait for
+    void (*remove)(void *impl, int fd);                              // stop watching fd
+};
+
+struct mux_server; // opaque type: its contents are private to mux_core.c
+
+/* Registers the listening socket and the job-completion pipe with the
+   backend and starts the job worker threads. NULL on failure (logged). */
+struct mux_server *mux_server_create(int listen_fd, int first_client_number,
+                                     const struct mux_backend *backend);
+
+/* Handles readiness `events` (MUX_*) for the descriptor registered with tag. */
+void mux_server_handle(struct mux_server *server, void *tag, unsigned events);
+
+/* Frees clients closed while handling the last batch of events. Call after
+   every batch, never in the middle of one. */
+void mux_server_end_batch(struct mux_server *server);
+
+#endif // end of the include guard
+===== END OF FILE: lab2-solution/project/mathserver/include/mux.h =====
+
+[18] lab2-solution/project/mathserver/src/mux_core.c
+    About: The single-process event loop logic: non-blocking per-client state
+           machine, output buffers, job queue with worker threads.
+
+===== FILE: lab2-solution/project/mathserver/src/mux_core.c =====
+/*
+ * mux_core.c - client handling shared by muxbasic (poll) and muxscale (epoll).
+ *
+ * One thread runs the event loop and does all socket I/O, without ever
+ * blocking: every client has a small state machine and its own input and
+ * output buffers. Computations would block the loop for seconds, so they
+ * go to a queue served by a few worker threads (the solvers then use their
+ * own pthreads). A worker reports a finished job by writing the job pointer
+ * into a pipe that the loop watches like any other descriptor. Everything
+ * stays inside one process.
+ */
+#define _GNU_SOURCE // enables pipe2()
+#include "mux.h"    // our own declarations
+
+#include <errno.h>      // errno, EAGAIN, EINTR, EMFILE, ...
+#include <fcntl.h>      // open(), O_CLOEXEC, O_RDONLY
+#include <pthread.h>    // worker threads, mutex, condition variable
+#include <stdlib.h>     // malloc(), calloc(), realloc(), free()
+#include <string.h>     // memcpy(), strlen(), strerror()
+#include <sys/socket.h> // accept(), recv(), send()
+#include <unistd.h>     // read(), write(), close(), pipe2()
+
+#include "job.h"         // jobs
+#include "parallel.h"    // cpu_count()
+#include "protocol.h"    // message format
+#include "server_util.h" // logging, set_nonblocking()
+
+#define KEEP_OUTPUT_BUFFER (1u << 20) /* free larger buffers once sent */
+
+/* Where a client is in its conversation. */
+enum stage {
+    STAGE_WAIT_COMMAND, /* reading the next command */
+    STAGE_WAIT_DATA,    /* k-means: reading the uploaded data file */
+    STAGE_COMPUTING     /* a worker thread is running this client's job */
+};
+
+/* Everything the event loop knows about one connected client. */
+struct mux_client {
+    int fd;                  // the client's socket
+    struct client_info info; // number and solution counters
+    enum stage stage;        // see enum stage
+    struct job *job;      /* job waiting for its data file */
+    unsigned interest;    /* events currently requested from the backend */
+
+    unsigned char header[MSG_HEADER_SIZE]; /* incoming message */
+    size_t header_got;                     // header bytes received so far (0..8)
+    uint32_t body_type, body_len, body_got; // type, payload length, payload bytes received
+    char *body;                            // the payload being received
+
+    char *out;            /* outgoing bytes */
+    size_t out_len, out_sent, out_cap; // bytes queued / bytes already sent / buffer size
+
+    int closing;          /* close once the output has been sent */
+    int closed;           /* socket closed; memory freed later */
+    struct mux_client *next_dead; // link in the list of clients waiting to be freed
+};
+
+/* Jobs waiting for a worker thread (a simple linked-list queue). */
+struct job_queue {
+    pthread_mutex_t lock;      // protects head and tail
+    pthread_cond_t not_empty;  // workers sleep here while the queue is empty
+    struct job *head, *tail;   // first and last job
+};
+
+/* The whole state of the multiplexing server. */
+struct mux_server {
+    struct mux_backend backend; // poll or epoll functions
+    int listen_fd;              // listening socket
+    int done_read, done_write; /* workers write finished jobs here */
+    int spare_fd;              /* given up when out of descriptors */
+    int next_client_number;    // number for the next client
+    struct job_queue queue;    // jobs waiting for a worker
+    struct mux_client *dead;   /* closed clients, freed after the batch */
+    char listener_tag, done_tag; /* their addresses tag these descriptors */
+};
+
+static void close_client(struct mux_server *s, struct mux_client *c); // defined below
+
+/* ------------------------------------------------------------------ */
+/* Client lifetime and output                                          */
+/* ------------------------------------------------------------------ */
+
+/* Frees all memory of a client (its socket is already closed). */
+static void free_client(struct mux_client *c)
+{
+    if (c->job) {             // a k-means job that was waiting for its data
+        job_release(c->job);
+        free(c->job);
+    }
+    free(c->body); // partly received message, if any
+    free(c->out);  // output buffer
+    free(c);       // the client record itself
+}
+
+/* Freed only in mux_server_end_batch(): the current batch of events may
+   still mention this client. */
+static void bury(struct mux_server *s, struct mux_client *c)
+{
+    c->next_dead = s->dead; // push onto the front of the "dead" list
+    s->dead = c;
+}
+
+static void close_client(struct mux_server *s, struct mux_client *c)
+{
+    if (c->closed)  // already closed: nothing to do
+        return;
+    s->backend.remove(s->backend.impl, c->fd); // stop watching the socket
+    close(c->fd);                              // close the connection
+    c->fd = -1;
+    c->closed = 1;
+    log_info("Client %d disconnected", c->info.number);
+    if (c->stage != STAGE_COMPUTING) /* otherwise job_finished() buries it */
+        bury(s, c);
+}
+
+/* Which events we want for this client right now. */
+static unsigned wanted_events(const struct mux_client *c)
+{
+    if (c->out_sent < c->out_len)
+        return MUX_WRITE; /* finish replying before reading the next request */
+    if (c->closing || c->stage == STAGE_COMPUTING)
+        return 0; // nothing to wait for (closing, or a worker is busy with its job)
+    return MUX_READ; // otherwise wait for the next message
+}
+
+/* Tells the backend if the wanted events changed. */
+static void update_interest(struct mux_server *s, struct mux_client *c)
+{
+    unsigned want; // the events we want now
+
+    if (c->closed)
+        return;
+    want = wanted_events(c);
+    if (want == c->interest) // unchanged: avoid a needless system call
+        return;
+    if (s->backend.modify(s->backend.impl, c->fd, c, want) < 0) {
+        log_error("Cannot watch client %d: %s", c->info.number, strerror(errno));
+        close_client(s, c);
+        return;
+    }
+    c->interest = want; // remember what the backend now watches
+}
+
+/* Sends as much queued output as the socket accepts without blocking. */
+static void flush_output(struct mux_server *s, struct mux_client *c)
+{
+    while (!c->closed && c->out_sent < c->out_len) { // unsent bytes remain
+        ssize_t n = send(c->fd, c->out + c->out_sent, c->out_len - c->out_sent, MSG_NOSIGNAL);
+        if (n < 0) {
+            if (errno == EINTR) // interrupted: retry
+                continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) // a real error (not "buffer full")
+                close_client(s, c);
+            return; // buffer full: wait until the socket is writable again
+        }
+        c->out_sent += (size_t)n; // these bytes are gone
+    }
+    if (c->closed)
+        return;
+    c->out_len = c->out_sent = 0; // everything sent: empty the buffer
+    if (c->out_cap > KEEP_OUTPUT_BUFFER) { // a big buffer (a large result): give the memory back
+        free(c->out);
+        c->out = NULL;
+        c->out_cap = 0;
+    }
+    if (c->closing) // we only waited for the output to leave
+        close_client(s, c);
+}
+
+/* Appends a message to the client's output and starts sending it. */
+static void queue_message(struct mux_server *s, struct mux_client *c, uint32_t type,
+                          const void *payload, uint32_t length)
+{
+    size_t needed; // buffer size needed after appending
+
+    if (c->closed)
+        return;
+    needed = c->out_len + MSG_HEADER_SIZE + length;
+    if (needed > c->out_cap) {                       // buffer too small:
+        size_t cap = c->out_cap ? c->out_cap : 4096; //   start at 4 KiB
+        char *grown;
+        while (cap < needed)                         //   double until it fits
+            cap *= 2;
+        grown = realloc(c->out, cap);
+        if (!grown) {
+            log_error("Out of memory while replying to client %d", c->info.number);
+            close_client(s, c);
+            return;
+        }
+        c->out = grown;
+        c->out_cap = cap;
+    }
+    encode_header((unsigned char *)c->out + c->out_len, type, length); // the header...
+    if (length > 0)
+        memcpy(c->out + c->out_len + MSG_HEADER_SIZE, payload, length); // ...then the payload
+    c->out_len = needed;
+    flush_output(s, c); // try to send right away
+}
+
+/* Queues a text message. */
+static void queue_text(struct mux_server *s, struct mux_client *c, uint32_t type, const char *text)
+{
+    queue_message(s, c, type, text, (uint32_t)strlen(text));
+}
+
+/* Queues a job's reply (result, info or error). */
+static void queue_reply(struct mux_server *s, struct mux_client *c, const struct job *job)
+{
+    if (job->reply_type == MSG_RESULT)
+        log_info("Sending solution: %s", job->result_name);
+    queue_message(s, c, job->reply_type, job->reply, job->reply_len);
+}
+
+/* ------------------------------------------------------------------ */
+/* Jobs                                                                */
+/* ------------------------------------------------------------------ */
+
+/* A worker thread: takes jobs from the queue, runs them, reports back. */
+static void *job_worker(void *arg)
+{
+    struct mux_server *s = arg; // the server (for the queue and the pipe)
+
+    for (;;) { // workers live as long as the server
+        struct job *job;
+        const char *p;  // used to write the job pointer into the pipe
+        size_t left;
+
+        pthread_mutex_lock(&s->queue.lock);
+        while (!s->queue.head) // queue empty: sleep until start_job() signals
+            pthread_cond_wait(&s->queue.not_empty, &s->queue.lock);
+        job = s->queue.head;            // take the first job
+        s->queue.head = job->next;
+        if (!s->queue.head)             // queue now empty
+            s->queue.tail = NULL;
+        pthread_mutex_unlock(&s->queue.lock);
+
+        job_execute(job); // the long computation, outside the lock
+
+        /* Hand the job back to the event loop (pointer-sized writes to a
+           pipe are atomic). */
+        p = (const char *)&job; // the bytes of the pointer value itself
+        left = sizeof job;
+        while (left > 0) {
+            ssize_t n = write(s->done_write, p, left);
+            if (n < 0) {
+                if (errno == EINTR) // interrupted: retry
+                    continue;
+                log_error("Lost a finished job: %s", strerror(errno));
+                break;
+            }
+            p += n;
+            left -= (size_t)n;
+        }
+    }
+    return NULL; // never reached
+}
+
+/* Puts a job in the queue for the worker threads. */
+static void start_job(struct mux_server *s, struct mux_client *c, struct job *job)
+{
+    job->owner = c;               // so the result finds its client again
+    job->next = NULL;
+    c->stage = STAGE_COMPUTING;   // stop reading from this client meanwhile
+
+    pthread_mutex_lock(&s->queue.lock);
+    if (s->queue.tail)                // append at the end of the queue
+        s->queue.tail->next = job;
+    else
+        s->queue.head = job;
+    s->queue.tail = job;
+    pthread_cond_signal(&s->queue.not_empty); // wake one sleeping worker
+    pthread_mutex_unlock(&s->queue.lock);
+}
+
+/* Called in the event loop when a worker has finished a job. */
+static void job_finished(struct mux_server *s, struct job *job)
+{
+    struct mux_client *c = job->owner; // the client who asked
+
+    c->stage = STAGE_WAIT_COMMAND;
+    if (c->closed) {
+        bury(s, c); /* the client left while its job was running */
+    } else {
+        queue_reply(s, c, job);  // send the result
+        update_interest(s, c);
+    }
+    job_release(job);
+    free(job);
+}
+
+/* Reads every finished-job pointer the workers wrote into the pipe. */
+static void collect_finished_jobs(struct mux_server *s)
+{
+    struct job *done[64]; // up to 64 pointers per read
+
+    for (;;) {
+        ssize_t n = read(s->done_read, done, sizeof done);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return; /* EAGAIN: nothing more for now */
+        for (size_t i = 0; i < (size_t)n / sizeof done[0]; i++) // each complete pointer
+            job_finished(s, done[i]);
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Requests                                                            */
+/* ------------------------------------------------------------------ */
+
+/* A complete command arrived from client c. */
+static void handle_command(struct mux_server *s, struct mux_client *c, const char *command)
+{
+    struct job *job = calloc(1, sizeof *job); // a new, zeroed job
+
+    log_info("Client %d commanded: %s", c->info.number, command);
+    if (!job) {
+        queue_text(s, c, MSG_ERROR, "The server is out of memory.");
+        return;
+    }
+    switch (job_prepare(job, command, &c->info)) {
+    case JOB_READY:            // matrix inversion: compute now
+        start_job(s, c, job);
+        return;
+    case JOB_NEEDS_DATA:       // k-means: ask for the data file first
+        c->job = job;
+        c->stage = STAGE_WAIT_DATA;
+        queue_text(s, c, MSG_NEED_DATA, job->kmeans.file);
+        return;
+    case JOB_REPLY_ONLY:       // help text or an error: just reply
+        queue_reply(s, c, job);
+        job_release(job);
+        free(job);
+        return;
+    }
+}
+
+/* Routes a complete message according to the client's stage. */
+static void handle_message(struct mux_server *s, struct mux_client *c,
+                           uint32_t type, const char *body, uint32_t length)
+{
+    struct job *job;
+
+    if (c->stage == STAGE_WAIT_COMMAND && type == MSG_COMMAND) { // a new command
+        handle_command(s, c, body);
+        return;
+    }
+    // Anything else must be the data file (or a cancel) of a k-means job.
+    if (c->stage != STAGE_WAIT_DATA || (type != MSG_DATA && type != MSG_CANCEL)) {
+        queue_text(s, c, MSG_ERROR, "Unexpected message.");
+        return;
+    }
+
+    job = c->job;                  // the k-means job that waited for this
+    c->job = NULL;
+    c->stage = STAGE_WAIT_COMMAND;
+    if (type == MSG_CANCEL) {      // the client could not read its file
+        log_info("Client %d cancelled the upload", c->info.number);
+        job_cancel(job, &c->info);
+        free(job);
+        return;
+    }
+    if (job_store_data(job, body, length) < 0) { // could not save the upload
+        queue_reply(s, c, job);
+        job_release(job);
+        free(job);
+        return;
+    }
+    log_info("Received the data file from client %d (%u bytes)", c->info.number, length);
+    start_job(s, c, job); // run the k-means job
+}
+
+/* Called once the 8-byte header is in: checks the size, allocates the body. */
+static int start_body(struct mux_server *s, struct mux_client *c)
+{
+    uint32_t limit; // largest payload allowed in this stage
+
+    decode_header(c->header, &c->body_type, &c->body_len);
+    // Commands are small; only an uploaded data file may be large.
+    limit = c->stage == STAGE_WAIT_DATA ? MAX_PAYLOAD_LEN : MAX_COMMAND_LEN;
+    if (c->body_len > limit) {
+        c->closing = 1; /* the stream cannot be resynchronised */
+        queue_text(s, c, MSG_ERROR, "Message too large; closing the connection.");
+        return -1;
+    }
+    c->body = malloc((size_t)c->body_len + 1); // +1 for a terminating NUL
+    if (!c->body) {
+        close_client(s, c);
+        return -1;
+    }
+    c->body_got = 0;
+    return 0;
+}
+
+/* A whole message has arrived: reset the input state and handle it. */
+static void complete_message(struct mux_server *s, struct mux_client *c)
+{
+    char *body = c->body; // take ownership of the payload
+
+    body[c->body_len] = '\0'; // NUL-terminate so it can be used as a string
+    c->body = NULL;           // ready for the next message
+    c->header_got = 0;
+    handle_message(s, c, c->body_type, body, c->body_len);
+    free(body);
+}
+
+/* Returns 1 if n bytes arrived; otherwise stops reading (closing on EOF or error). */
+static int received(struct mux_server *s, struct mux_client *c, ssize_t n)
+{
+    if (n > 0)
+        return 1;
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return 0; /* level-triggered: we will be told again */
+    close_client(s, c); // n == 0 (client closed) or a real error
+    return 0;
+}
+
+/* Reads what is available, one message at a time and never more than the
+   current message, so a following request stays queued in the kernel. */
+static void read_input(struct mux_server *s, struct mux_client *c)
+{
+    while (!c->closed && (wanted_events(c) & MUX_READ)) { // while we still want input
+        if (c->header_got < MSG_HEADER_SIZE) {             // still reading the header
+            ssize_t n = recv(c->fd, c->header + c->header_got, MSG_HEADER_SIZE - c->header_got, 0);
+            if (!received(s, c, n))
+                return;
+            c->header_got += (size_t)n;
+            if (c->header_got < MSG_HEADER_SIZE) // header still incomplete
+                continue;
+            if (start_body(s, c) < 0) // header complete: prepare for the payload
+                return;
+        }
+        if (c->body_got < c->body_len) { // still reading the payload
+            ssize_t n = recv(c->fd, c->body + c->body_got, c->body_len - c->body_got, 0);
+            if (!received(s, c, n))
+                return;
+            c->body_got += (uint32_t)n;
+            if (c->body_got < c->body_len) // payload still incomplete
+                continue;
+        }
+        complete_message(s, c); // header and payload complete
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* New connections                                                     */
+/* ------------------------------------------------------------------ */
+
+/* Registers a newly accepted connection and greets it. */
+static void add_client(struct mux_server *s, int fd)
+{
+    struct mux_client *c = calloc(1, sizeof *c); // zeroed client record
+    char welcome[16];
+
+    if (!c || set_nonblocking(fd) < 0) { // no memory, or cannot make it non-blocking
+        free(c);
+        close(fd);
+        return;
+    }
+    c->fd = fd;
+    c->info.number = s->next_client_number++; // assign the client number
+    c->stage = STAGE_WAIT_COMMAND;
+    if (s->backend.add(s->backend.impl, fd, c, MUX_READ) < 0) { // start watching it
+        log_error("Cannot watch a new client: %s", strerror(errno));
+        close(fd);
+        free(c);
+        return;
+    }
+    c->interest = MUX_READ;
+    log_info("Connected with client %d", c->info.number);
+    snprintf(welcome, sizeof welcome, "%d", c->info.number);
+    queue_text(s, c, MSG_WELCOME, welcome); // tell the client its number
+    update_interest(s, c);
+}
+
+/* Accepts every pending connection (the listening socket is non-blocking). */
+static void accept_clients(struct mux_server *s)
+{
+    for (;;) {
+        int fd = accept(s->listen_fd, NULL, NULL);
+
+        if (fd >= 0) {         // got one: register it and look for more
+            add_client(s, fd);
+            continue;
+        }
+        if (errno == EINTR || errno == ECONNABORTED) // harmless: try again
+            continue;
+        if ((errno == EMFILE || errno == ENFILE) && s->spare_fd >= 0) {
+            /* Out of descriptors: accept with the spare one and hang up,
+               instead of leaving the connection pending (which would make
+               the loop spin). */
+            close(s->spare_fd);                    // frees one descriptor
+            fd = accept(s->listen_fd, NULL, NULL); // take the waiting connection...
+            if (fd >= 0)
+                close(fd);                         // ...and close it at once
+            s->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC); // reserve a spare again
+            log_error("Too many open connections; refused a client");
+            continue;
+        }
+        if (errno != EAGAIN && errno != EWOULDBLOCK) // EAGAIN just means "no more waiting"
+            log_error("accept: %s", strerror(errno));
+        return;
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Public interface                                                    */
+/* ------------------------------------------------------------------ */
+
+/* Starts the job worker threads (one per core, at least two). */
+static int start_workers(struct mux_server *s)
+{
+    int wanted = cpu_count() > 2 ? cpu_count() : 2;
+    int started = 0;
+    pthread_attr_t attr;
+
+    if (pthread_attr_init(&attr) != 0)
+        return -1;
+    // Detached: nobody joins these threads; they run until the process ends.
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    for (int i = 0; i < wanted; i++) {
+        pthread_t thread;
+        if (pthread_create(&thread, &attr, job_worker, s) == 0)
+            started++;
+    }
+    pthread_attr_destroy(&attr);
+    return started > 0 ? 0 : -1; // one worker is enough to function
+}
+
+struct mux_server *mux_server_create(int listen_fd, int first_client_number,
+                                     const struct mux_backend *backend)
+{
+    struct mux_server *s = calloc(1, sizeof *s); // zeroed server state
+    int pipe_fds[2];                             // [0] = read end, [1] = write end
+
+    if (!s || pipe2(pipe_fds, O_CLOEXEC) < 0) { // the job-completion pipe
+        log_error("Cannot start the server: %s", strerror(errno));
+        free(s);
+        return NULL;
+    }
+    s->backend = *backend;
+    s->listen_fd = listen_fd;
+    s->done_read = pipe_fds[0];
+    s->done_write = pipe_fds[1];
+    s->spare_fd = open("/dev/null", O_RDONLY | O_CLOEXEC); // reserve for the EMFILE case
+    s->next_client_number = first_client_number;
+    pthread_mutex_init(&s->queue.lock, NULL);
+    pthread_cond_init(&s->queue.not_empty, NULL);
+
+    // The loop must never block: make the listener and the pipe's read end
+    // non-blocking, watch both, and start the workers.
+    if (set_nonblocking(listen_fd) < 0 || set_nonblocking(s->done_read) < 0
+        || backend->add(backend->impl, listen_fd, &s->listener_tag, MUX_READ) < 0
+        || backend->add(backend->impl, s->done_read, &s->done_tag, MUX_READ) < 0
+        || start_workers(s) < 0) {
+        log_error("Cannot start the server: %s", strerror(errno));
+        return NULL; /* the process exits; nothing to clean up */
+    }
+    return s;
+}
+
+void mux_server_handle(struct mux_server *s, void *tag, unsigned events)
+{
+    struct mux_client *c = tag; // for clients, the tag is the client record
+
+    if (tag == &s->listener_tag) { // the listening socket: new connections
+        accept_clients(s);
+        return;
+    }
+    if (tag == &s->done_tag) {     // the pipe: finished jobs
+        collect_finished_jobs(s);
+        return;
+    }
+    if (c->closed)                 // closed earlier in this batch: ignore
+        return;
+    if (events & MUX_ERROR) {      // error or hang-up: drop the client
+        close_client(s, c);
+        return;
+    }
+    if (events & MUX_WRITE)        // room to send: continue sending
+        flush_output(s, c);
+    if (events & MUX_READ)         // data arrived: read it
+        read_input(s, c);
+    update_interest(s, c);         // adjust what we wait for next
+}
+
+void mux_server_end_batch(struct mux_server *s)
+{
+    while (s->dead) {                 // free every client closed during the batch
+        struct mux_client *c = s->dead;
+        s->dead = c->next_dead;
+        free_client(c);
+    }
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/mux_core.c =====
+
+[19] lab2-solution/project/mathserver/src/strategy_muxbasic.c
+    About: muxbasic: the event loop waits with poll() (scans every descriptor
+           each round).
+
+===== FILE: lab2-solution/project/mathserver/src/strategy_muxbasic.c =====
+/*
+ * strategy_muxbasic.c - one process watches every client with poll().
+ *
+ * poll() gets the whole list of descriptors on every call and the loop
+ * then scans all of them, so the cost grows with the number of clients.
+ * The protocol and client logic live in mux_core.c.
+ */
+#define _GNU_SOURCE        // GNU/Linux extras
+#include "strategies.h"    // our own declaration
+
+#include <errno.h>  // errno, EINTR, ENOENT
+#include <poll.h>   // poll(), struct pollfd, POLLIN, POLLOUT, ...
+#include <stdlib.h> // realloc()
+#include <string.h> // strerror()
+
+#include "mux.h"         // the shared core and the backend interface
+#include "server_util.h" // log_error()
+
+/* The pollfd array, the tag of each entry, and where each fd sits in it. */
+struct poll_set {
+    struct pollfd *fds;  // the array handed to poll()
+    void **tags;         // tags[i] belongs to fds[i]
+    size_t count, capacity; // entries in use / room in the arrays
+    int *slot_of;        /* slot_of[fd] = index in fds, or -1 */
+    size_t slot_of_size; // length of the slot_of array
+};
+
+/* One ready descriptor, copied out before handling (see the loop below). */
+struct ready_event {
+    void *tag;       // which client/listener/pipe
+    unsigned events; // MUX_* flags
+};
+
+/* Converts the core's MUX_* interest flags to poll() flags. */
+static short to_poll(unsigned interest)
+{
+    short events = 0;
+
+    if (interest & MUX_READ)
+        events |= POLLIN;  // wake when readable
+    if (interest & MUX_WRITE)
+        events |= POLLOUT; // wake when writable
+    return events;
+}
+
+/* Converts poll()'s result flags to the core's MUX_* flags. */
+static unsigned from_poll(short revents)
+{
+    unsigned events = 0;
+
+    if (revents & POLLIN)
+        events |= MUX_READ;
+    if (revents & POLLOUT)
+        events |= MUX_WRITE;
+    // POLLERR = error, POLLHUP = hung up, POLLNVAL = not an open descriptor
+    if (revents & (POLLERR | POLLHUP | POLLNVAL))
+        events |= MUX_ERROR;
+    return events;
+}
+
+/* Index of fd in the arrays, or -1 if it is not watched. */
+static int slot_of(const struct poll_set *set, int fd)
+{
+    return fd >= 0 && (size_t)fd < set->slot_of_size ? set->slot_of[fd] : -1;
+}
+
+/* Backend "add": append fd to the arrays. */
+static int poll_add(void *impl, int fd, void *tag, unsigned interest)
+{
+    struct poll_set *set = impl;
+
+    if ((size_t)fd >= set->slot_of_size) {   // the fd -> slot map is too short:
+        size_t size = set->slot_of_size ? set->slot_of_size : 64;
+        int *map;
+        while (size <= (size_t)fd)           // double until fd fits
+            size *= 2;
+        map = realloc(set->slot_of, size * sizeof *map);
+        if (!map)
+            return -1;
+        for (size_t i = set->slot_of_size; i < size; i++) // new entries: "not watched"
+            map[i] = -1;
+        set->slot_of = map;
+        set->slot_of_size = size;
+    }
+    if (set->count == set->capacity) {       // arrays full: double them
+        size_t capacity = set->capacity ? set->capacity * 2 : 64;
+        struct pollfd *fds = realloc(set->fds, capacity * sizeof *fds);
+        void **tags;
+        if (!fds)
+            return -1;
+        set->fds = fds;
+        tags = realloc(set->tags, capacity * sizeof *tags);
+        if (!tags)
+            return -1;
+        set->tags = tags;
+        set->capacity = capacity;
+    }
+    set->fds[set->count] = (struct pollfd){ .fd = fd, .events = to_poll(interest) }; // new entry
+    set->tags[set->count] = tag;
+    set->slot_of[fd] = (int)set->count++; // remember where it is
+    return 0;
+}
+
+/* Backend "modify": change the events wanted for fd. */
+static int poll_modify(void *impl, int fd, void *tag, unsigned interest)
+{
+    struct poll_set *set = impl;
+    int slot = slot_of(set, fd);
+
+    (void)tag; // not needed: the tag does not change
+    if (slot < 0) {
+        errno = ENOENT; // fd is not watched
+        return -1;
+    }
+    set->fds[slot].events = to_poll(interest);
+    return 0;
+}
+
+/* Backend "remove": take fd out of the arrays. */
+static void poll_remove(void *impl, int fd)
+{
+    struct poll_set *set = impl;
+    int slot = slot_of(set, fd);
+    size_t last;
+
+    if (slot < 0)
+        return;
+    last = --set->count;           // index of the last entry; one entry fewer
+    if ((size_t)slot != last) { /* move the last entry into the gap */
+        set->fds[slot] = set->fds[last];
+        set->tags[slot] = set->tags[last];
+        set->slot_of[set->fds[slot].fd] = slot; // the moved entry has a new index
+    }
+    set->slot_of[fd] = -1; // fd is no longer watched
+}
+
+int run_muxbasic_strategy(int listen_fd, int first_client_number)
+{
+    struct poll_set set = { 0 }; // empty set
+    // Hand the core our set and the three functions that change it.
+    const struct mux_backend backend = { &set, poll_add, poll_modify, poll_remove };
+    struct mux_server *server = mux_server_create(listen_fd, first_client_number, &backend);
+    struct ready_event *ready = NULL; // copy of the ready entries of one round
+    size_t ready_capacity = 0;
+
+    if (!server)
+        return 1;
+    for (;;) { // the event loop
+        size_t count = 0; // ready entries this round
+
+        // Wait (-1 = no time limit) until at least one descriptor is ready.
+        if (poll(set.fds, (nfds_t)set.count, -1) < 0) {
+            if (errno == EINTR)
+                continue;
+            log_error("poll: %s", strerror(errno));
+            return 1;
+        }
+        /* Handlers add and remove descriptors, so act on a copy. */
+        if (ready_capacity < set.count) { // make the copy array big enough
+            struct ready_event *grown = realloc(ready, set.capacity * sizeof *grown);
+            if (!grown) {
+                log_error("Out of memory");
+                return 1;
+            }
+            ready = grown;
+            ready_capacity = set.capacity;
+        }
+        for (size_t i = 0; i < set.count; i++) // scan ALL entries (the O(n) part)
+            if (set.fds[i].revents)            // this one has something to report
+                ready[count++] = (struct ready_event){ set.tags[i], from_poll(set.fds[i].revents) };
+        for (size_t i = 0; i < count; i++)     // handle each ready descriptor
+            mux_server_handle(server, ready[i].tag, ready[i].events);
+        mux_server_end_batch(server);          // now it is safe to free closed clients
+    }
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/strategy_muxbasic.c =====
+
+[20] lab2-solution/project/mathserver/src/strategy_muxscale.c
+    About: muxscale: the event loop waits with epoll (the kernel reports only
+           ready descriptors).
+
+===== FILE: lab2-solution/project/mathserver/src/strategy_muxscale.c =====
+/*
+ * strategy_muxscale.c - one process watches every client with epoll.
+ *
+ * The kernel keeps the set of watched descriptors, and epoll_wait() returns
+ * only the ones that are ready, so the cost depends on activity rather than
+ * on the number of connected clients. Level-triggered mode is used: a
+ * descriptor is reported again until it has been fully handled. The
+ * protocol and client logic live in mux_core.c.
+ */
+#define _GNU_SOURCE        // GNU/Linux extras
+#include "strategies.h"    // our own declaration
+
+#include <errno.h>     // errno, EINTR
+#include <string.h>    // strerror()
+#include <sys/epoll.h> // epoll_create1(), epoll_ctl(), epoll_wait()
+
+#include "mux.h"         // the shared core and the backend interface
+#include "server_util.h" // log_error()
+
+#define MAX_EVENTS 256 // most ready descriptors returned by one epoll_wait()
+
+/* Converts the core's MUX_* interest flags to epoll flags. */
+static uint32_t to_epoll(unsigned interest)
+{
+    uint32_t events = 0;
+
+    if (interest & MUX_READ)
+        events |= EPOLLIN;  // wake when readable
+    if (interest & MUX_WRITE)
+        events |= EPOLLOUT; // wake when writable
+    return events;
+}
+
+/* Converts epoll's result flags to the core's MUX_* flags. */
+static unsigned from_epoll(uint32_t events)
+{
+    unsigned result = 0;
+
+    if (events & EPOLLIN)
+        result |= MUX_READ;
+    if (events & EPOLLOUT)
+        result |= MUX_WRITE;
+    if (events & (EPOLLERR | EPOLLHUP)) // error or hang-up (always reported)
+        result |= MUX_ERROR;
+    return result;
+}
+
+/* Common part of add and modify: one epoll_ctl() call. */
+static int epoll_control(void *impl, int op, int fd, void *tag, unsigned interest)
+{
+    // data.ptr is returned with every event for this fd: that is the tag.
+    struct epoll_event event = { .events = to_epoll(interest), .data.ptr = tag };
+    return epoll_ctl(*(int *)impl, op, fd, &event); // impl points at the epoll descriptor
+}
+
+static int epoll_add(void *impl, int fd, void *tag, unsigned interest)
+{
+    return epoll_control(impl, EPOLL_CTL_ADD, fd, tag, interest); // start watching
+}
+
+static int epoll_modify(void *impl, int fd, void *tag, unsigned interest)
+{
+    return epoll_control(impl, EPOLL_CTL_MOD, fd, tag, interest); // change the events
+}
+
+static void epoll_remove(void *impl, int fd)
+{
+    epoll_ctl(*(int *)impl, EPOLL_CTL_DEL, fd, NULL); // stop watching
+}
+
+int run_muxscale_strategy(int listen_fd, int first_client_number)
+{
+    struct epoll_event events[MAX_EVENTS]; // filled by epoll_wait()
+    int epoll_fd = epoll_create1(EPOLL_CLOEXEC); // the kernel-side watch list
+    struct mux_backend backend = { &epoll_fd, epoll_add, epoll_modify, epoll_remove };
+    struct mux_server *server;
+
+    if (epoll_fd < 0) {
+        log_error("epoll_create1: %s", strerror(errno));
+        return 1;
+    }
+    server = mux_server_create(listen_fd, first_client_number, &backend);
+    if (!server)
+        return 1;
+    for (;;) { // the event loop
+        // Wait (-1 = no time limit); returns how many descriptors are ready.
+        int count = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
+
+        if (count < 0) {
+            if (errno == EINTR)
+                continue;
+            log_error("epoll_wait: %s", strerror(errno));
+            return 1;
+        }
+        for (int i = 0; i < count; i++) // only the ready ones: no full scan
+            mux_server_handle(server, events[i].data.ptr, from_epoll(events[i].events));
+        mux_server_end_batch(server);   // now it is safe to free closed clients
+    }
+}
+===== END OF FILE: lab2-solution/project/mathserver/src/strategy_muxscale.c =====
+
+
+################################################################################
+# PART 5 - THE CLIENT
+################################################################################
+
+[21] lab2-solution/project/client/client.c
+    About: The client: connects with -ip and -p, sends commands, uploads the
+           k-means data file on request, saves results in results/ without
+           overwriting.
+
+===== FILE: lab2-solution/project/client/client.c =====
+/*
+ * client.c - command-line client for the math server.
+ *
+ *   ./client -ip <server address> -p <port>
+ *
+ * Reads commands from the terminal (or a pipe), sends them to the server,
+ * uploads the k-means data file when the server asks for it, and saves
+ * every received solution in the results folder next to this program,
+ * never overwriting an earlier file. Ends at end of input, on "quit", or
+ * with Ctrl+C.
+ */
+#define _GNU_SOURCE        // GNU/Linux extras (getopt_long_only, NAME_MAX, ...)
+#include <errno.h>      // errno and error codes
+#include <fcntl.h>      // open(), O_* flags
+#include <getopt.h>     // getopt_long_only(), struct option
+#include <limits.h>     // PATH_MAX, NAME_MAX
+#include <netdb.h>      // getaddrinfo(): turns a host name or IP text into an address
+#include <signal.h>     // signal(), SIGPIPE
+#include <stdio.h>      // printf(), fgets(), fopen(), fread(), ...
+#include <stdlib.h>     // malloc(), free()
+#include <string.h>     // strlen(), strcmp(), strchr(), strrchr(), memchr(), strerror()
+#include <sys/socket.h> // socket(), connect()
+#include <sys/stat.h>   // fstat(), mkdir(), S_ISREG()
+#include <unistd.h>     // close(), write(), unlink(), readlink()
+
+#include "protocol.h" // the shared message format and send/receive helpers
+
+#define EXIT_BAD_OPTION 3      // exit code for wrong options (same as the server)
+#define MAX_NAME_ATTEMPTS 10000 // most "_2", "_3", ... variants tried for a file name
+
+/* Prints how to start the client. */
+static void usage(FILE *out, const char *program)
+{
+    fprintf(out, "Usage: %s -ip <server address> -p <port>\n", program);
+}
+
+/* Connects to host:port. Returns the socket, or -1 (message printed). */
+static int connect_to_server(const char *host, const char *port)
+{
+    struct addrinfo hints = { 0 }, *list; // what we want / the addresses found
+    int fd = -1, last_errno = 0;          // socket / the last connection error
+    int rc;
+
+    hints.ai_family = AF_UNSPEC;     // IPv4 or IPv6, whatever the host has
+    hints.ai_socktype = SOCK_STREAM; // TCP
+    rc = getaddrinfo(host, port, &hints, &list); // look up the address(es)
+    if (rc != 0) {
+        fprintf(stderr, "Cannot find server %s: %s\n", host, gai_strerror(rc));
+        return -1;
+    }
+    // Try each address in turn until one connects.
+    for (struct addrinfo *ai = list; ai && fd < 0; ai = ai->ai_next) {
+        fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+        if (fd < 0) {
+            last_errno = errno;
+            continue;
+        }
+        if (connect(fd, ai->ai_addr, ai->ai_addrlen) < 0) { // TCP handshake with the server
+            last_errno = errno;
+            close(fd);
+            fd = -1;
+        }
+    }
+    freeaddrinfo(list); // free the lookup result
+    if (fd < 0)
+        fprintf(stderr, "Cannot connect to %s:%s: %s\n", host, port, strerror(last_errno));
+    return fd;
+}
+
+/* <folder of this program>/results, created if needed. */
+static int find_results_dir(char *dir, size_t size)
+{
+    char exe[PATH_MAX];
+    // /proc/self/exe is a link to this program's own file.
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    char *slash;
+
+    if (len < 0)
+        return -1;
+    exe[len] = '\0';           // readlink does not add the NUL
+    slash = strrchr(exe, '/'); // cut off the file name...
+    if (slash)
+        *slash = '\0';         // ...leaving the folder
+    if (snprintf(dir, size, "%s/results", exe) >= (int)size) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return mkdir(dir, 0755) == 0 || errno == EEXIST ? 0 : -1; // create it if missing
+}
+
+/* write() may write less than asked: loop until everything is written. */
+static int write_all(int fd, const char *data, size_t len)
+{
+    while (len > 0) {
+        ssize_t n = write(fd, data, len);
+        if (n < 0) {
+            if (errno == EINTR) // interrupted: retry
+                continue;
+            return -1;
+        }
+        data += n;
+        len -= (size_t)n;
+    }
+    return 0;
+}
+
+/*
+ * Saves data as dir/name without replacing an existing file: if the name is
+ * taken, "_2", "_3", ... is added before the extension. The name actually
+ * used is stored in saved.
+ */
+static int save_new_file(const char *dir, const char *name, const char *data, size_t len,
+                         char *saved, size_t saved_size)
+{
+    const char *base = strrchr(name, '/'); // a '/' in the name would leave the folder
+    const char *dot;                       // the extension's dot, e.g. in ".txt"
+    int stem_len;                          // length of the name without the extension
+
+    base = base ? base + 1 : name; /* never write outside the results folder */
+    if (*base == '\0' || strcmp(base, ".") == 0 || strcmp(base, "..") == 0)
+        base = "solution.txt";     // unusable name: use a safe default
+    dot = strrchr(base, '.');
+    stem_len = dot ? (int)(dot - base) : (int)strlen(base);
+
+    for (int copy = 1; copy <= MAX_NAME_ATTEMPTS; copy++) {
+        char path[PATH_MAX];
+        int fd, ok;
+
+        if (copy == 1)  // first try: the name as received
+            snprintf(saved, saved_size, "%s", base);
+        else            // later tries: name_2.txt, name_3.txt, ...
+            snprintf(saved, saved_size, "%.*s_%d%s", stem_len, base, copy, dot ? dot : "");
+        if (snprintf(path, sizeof path, "%s/%s", dir, saved) >= (int)sizeof path) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        // O_EXCL: fail with EEXIST instead of overwriting an existing file.
+        fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+        if (fd < 0) {
+            if (errno == EEXIST) // taken: try the next variant
+                continue;
+            return -1;
+        }
+        ok = write_all(fd, data, len) == 0;
+        if (close(fd) != 0)
+            ok = 0;
+        if (!ok) {       // incomplete file: remove it
+            unlink(path);
+            return -1;
+        }
+        return 0;
+    }
+    errno = EEXIST; // every variant was taken
+    return -1;
+}
+
+/* Reads a whole regular file into a new buffer; *len receives its size. */
+static char *read_file(const char *path, size_t *len)
+{
+    FILE *in = fopen(path, "rb"); // open for reading ("b" = binary, no conversions)
+    struct stat st;               // file information (type, size)
+    char *data;
+    int problem = 0;              // errno value to report, 0 = fine
+
+    if (!in)
+        return NULL; // errno says why (e.g. ENOENT = no such file)
+    if (fstat(fileno(in), &st) < 0)                      // could not get the file information
+        problem = errno;
+    else if (!S_ISREG(st.st_mode))                       // a folder or device, not a file
+        problem = EINVAL;
+    else if (st.st_size > (off_t)MAX_PAYLOAD_LEN)        // too large to send
+        problem = EFBIG;
+    if (problem) {
+        fclose(in);
+        errno = problem; // set errno last, so fclose() cannot change it
+        return NULL;
+    }
+    data = malloc((size_t)st.st_size + 1); // room for the whole file
+    if (!data || fread(data, 1, (size_t)st.st_size, in) != (size_t)st.st_size) {
+        free(data);
+        fclose(in);
+        errno = EIO; // input/output error
+        return NULL;
+    }
+    fclose(in);
+    *len = (size_t)st.st_size;
+    return data; // the caller frees it
+}
+
+/* Sends the file the server asked for. Returns 0 if sent (a result will
+   follow), 1 if the upload was cancelled, -1 if the connection broke. */
+static int upload(int fd, const char *path)
+{
+    size_t len;
+    char *data = read_file(path, &len);
+    int rc;
+
+    if (!data) { // cannot read it: tell the user and the server
+        printf("Cannot read the data file '%s': %s\n", path, strerror(errno));
+        return send_msg(fd, MSG_CANCEL, NULL, 0) < 0 ? -1 : 1;
+    }
+    rc = send_msg(fd, MSG_DATA, data, (uint32_t)len); // send the contents
+    free(data);
+    if (rc < 0)
+        return -1;
+    printf("Sent the data file: %s (%zu bytes)\n", path, len); // feedback required by the handout
+    return 0;
+}
+
+/* A RESULT payload is "<file name>\n<file contents>". */
+static void store_solution(const char *results_dir, char *payload, uint32_t len)
+{
+    char *newline = memchr(payload, '\n', len); // end of the name line
+    char saved[NAME_MAX + 1];                   // the name the file was saved under
+
+    if (!newline) {
+        printf("The server sent a malformed solution.\n");
+        return;
+    }
+    *newline = '\0'; // payload is now just the name; the contents start after it
+    if (save_new_file(results_dir, payload, newline + 1, len - (size_t)(newline + 1 - payload),
+                      saved, sizeof saved) < 0)
+        printf("Could not save the solution %s: %s\n", payload, strerror(errno));
+    else
+        printf("Received the solution: %s\n", saved); // as in the handout
+}
+
+/* Handles the server's answer to one command. -1 if the connection broke. */
+static int await_answer(int fd, const char *results_dir)
+{
+    for (;;) { // a k-means command takes two rounds: NEED_DATA, then RESULT
+        uint32_t type, len;
+        char *payload;
+        int finished = 1, rc = 0; // finished = this command is fully answered
+
+        if (recv_msg(fd, &type, &payload, &len, MAX_PAYLOAD_LEN) < 0)
+            return -1; // connection lost
+        switch (type) {
+        case MSG_NEED_DATA:          // the server wants the data file
+            rc = upload(fd, payload);
+            finished = rc != 0;      // after a successful upload, wait for the result
+            break;
+        case MSG_RESULT:             // a result file
+            store_solution(results_dir, payload, len);
+            break;
+        case MSG_INFO:               // help or usage text
+            printf("%s\n", payload);
+            break;
+        case MSG_ERROR:              // the command failed
+            printf("Server error: %s\n", payload);
+            break;
+        default:
+            printf("Unexpected message (type %u) from the server.\n", type);
+            break;
+        }
+        free(payload);
+        if (rc < 0)
+            return -1;
+        if (finished)
+            return 0;
+    }
+}
+
+/* Removes leading and trailing white space in place. */
+static char *trim(char *s)
+{
+    char *end;
+
+    while (*s == ' ' || *s == '\t') // skip leading spaces/tabs
+        s++;
+    end = s + strlen(s);            // one past the last character
+    while (end > s && strchr(" \t\r\n", end[-1])) // cut trailing white space
+        *--end = '\0';
+    return s;
+}
+
+int main(int argc, char **argv)
+{
+    // The accepted options: -ip <address>, -p <port>, -h.
+    static const struct option options[] = {
+        { "ip", required_argument, NULL, 'i' },
+        { "p", required_argument, NULL, 'p' },
+        { "h", no_argument, NULL, 'h' },
+        { NULL, 0, NULL, 0 },  // end of the list
+    };
+    const char *host = NULL, *port = NULL; // from -ip and -p
+    char results_dir[PATH_MAX];            // where solutions are saved
+    char line[MAX_COMMAND_LEN + 2];        // one typed command (+ newline + NUL)
+    uint32_t type, len;
+    char *welcome;                         // the server's greeting (our client number)
+    int opt, fd;
+
+    /* getopt() would read "-ip" as -i with value "p"; getopt_long_only()
+       accepts multi-letter options after a single dash. */
+    opterr = 0; // we print our own error message
+    while ((opt = getopt_long_only(argc, argv, "", options, NULL)) != -1) {
+        switch (opt) {
+        case 'i':
+            host = optarg;
+            break;
+        case 'p':
+            port = optarg;
+            break;
+        case 'h':
+            usage(stdout, argv[0]);
+            return 0;
+        default:
+            fprintf(stderr, "Unsupported or incomplete option.\n");
+            usage(stderr, argv[0]);
+            return EXIT_BAD_OPTION;
+        }
+    }
+    if (!host || !port || optind < argc) { // both options are required, nothing else allowed
+        usage(stderr, argv[0]);
+        return EXIT_BAD_OPTION;
+    }
+
+    setvbuf(stdout, NULL, _IOLBF, 0); // line-buffered: messages appear immediately
+    signal(SIGPIPE, SIG_IGN);         // a closed connection gives an error, not a crash
+    if (find_results_dir(results_dir, sizeof results_dir) < 0) {
+        perror("Cannot prepare the results folder");
+        return 1;
+    }
+    fd = connect_to_server(host, port);
+    if (fd < 0)
+        return 1;
+    // The first message must be the server's WELCOME with our client number.
+    if (recv_msg(fd, &type, &welcome, &len, 64) < 0 || type != MSG_WELCOME) {
+        fprintf(stderr, "The server did not answer.\n");
+        close(fd);
+        return 1;
+    }
+    printf("Connected to server (you are client %s)\n", welcome);
+    free(welcome);
+
+    for (;;) { // one loop pass per command
+        char *command;
+
+        printf("Enter a command for the server: ");
+        fflush(stdout);                       // show the prompt before waiting for input
+        if (!fgets(line, sizeof line, stdin)) { // end of input (Ctrl+D or end of a pipe)
+            putchar('\n');
+            break;
+        }
+        if (!strchr(line, '\n') && !feof(stdin)) { // no newline: the line was too long
+            int ch;
+            while ((ch = getchar()) != '\n' && ch != EOF) { // throw away the rest of it
+            }
+            printf("The command is too long (at most %u characters).\n", MAX_COMMAND_LEN);
+            continue;
+        }
+        command = trim(line);
+        if (*command == '\0') // empty line: ask again
+            continue;
+        if (strcmp(command, "quit") == 0 || strcmp(command, "exit") == 0)
+            break;
+        // Send the command, then handle the answer (and any upload request).
+        if (send_msg(fd, MSG_COMMAND, command, (uint32_t)strlen(command)) < 0
+            || await_answer(fd, results_dir) < 0) {
+            printf("Lost the connection to the server.\n");
+            close(fd);
+            return 1;
+        }
+    }
+    close(fd); // say goodbye: the server sees the connection close
+    return 0;
+}
+===== END OF FILE: lab2-solution/project/client/client.c =====
+
+
+################################################################################
+# PART 6 - BUILD FILE (not C, but needed to compile everything)
+################################################################################
+
+[22] lab2-solution/project/Makefile
+    About: Run 'make' in lab2-solution/project to build server, client/client,
+           matinvpar and kmeanspar. Command lines start with a TAB character.
+
+===== FILE: lab2-solution/project/Makefile =====
+# Math server - run "make" in this folder.
+#
+#   server          the math server (project folder)
+#   client/client   the client; a file cannot be called "client" here because
+#                   the client/ folder already uses that name
+#   matinvpar       standalone parallel matrix inversion (for testing)
+#   kmeanspar       standalone parallel k-means (for testing)
+#
+# Extra flags, e.g. sanitizers: make EXTRA_FLAGS=-fsanitize=thread
+
+# ---- Tools and flags ----
+# CC: the C compiler.
+# EXTRA_FLAGS: empty by default; ?= lets the command line set it (e.g. sanitizers).
+# CFLAGS: C11 with GNU extensions, optimise (-O2), all warnings, thread support,
+#         and look for #include files in mathserver/include.
+# LDFLAGS: flags for linking (thread library).
+# DEPFLAGS: also write a .d file listing the headers each .c file uses, so
+#           'make' rebuilds a file when one of its headers changes.
+CC          := gcc
+EXTRA_FLAGS ?=
+CFLAGS      := -std=gnu11 -O2 -Wall -Wextra -pthread -Imathserver/include $(EXTRA_FLAGS)
+LDFLAGS     := -pthread $(EXTRA_FLAGS)
+DEPFLAGS     = -MMD -MP
+
+# ---- Folders required by the handout ----
+# Server sources live in mathserver/src, object files go to mathserver/objects.
+SRC_DIR := mathserver/src
+OBJ_DIR := mathserver/objects
+
+# ---- Server source files ----
+# SERVER_SRCS lists them (a trailing backslash continues the line);
+# SERVER_OBJS turns 'x.c' into 'mathserver/objects/x.o' for each of them.
+SERVER_SRCS := server.c server_util.c protocol.c job.c parallel.c \
+               matinv-par.c kmeans-par.c strategy_fork.c mux_core.c \
+               strategy_muxbasic.c strategy_muxscale.c
+SERVER_OBJS := $(addprefix $(OBJ_DIR)/,$(SERVER_SRCS:.c=.o))
+
+# ---- Output programs ----
+# The client binary is client/client because the project folder already
+# contains a directory named 'client'.
+SERVER    := server
+CLIENT    := client/client
+MATINVPAR := matinvpar
+KMEANSPAR := kmeanspar
+
+# ---- Rules ----
+# 'make' with no target builds the first target, 'all': all four programs.
+# Rule format:   target: prerequisites   then TAB-indented commands.
+# Automatic variables: $@ = the target, $^ = all prerequisites, $< = the first one.
+all: $(SERVER) $(CLIENT) $(MATINVPAR) $(KMEANSPAR)
+
+# Link all server object files into the 'server' program.
+$(SERVER): $(SERVER_OBJS)
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# Compile and link the client in one step, together with the shared protocol code.
+$(CLIENT): client/client.c $(OBJ_DIR)/protocol.o mathserver/include/protocol.h
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ client/client.c $(OBJ_DIR)/protocol.o
+
+# Standalone matrix-inversion program (for testing): its own main() plus the thread helper.
+$(MATINVPAR): $(OBJ_DIR)/matinv-standalone.o $(OBJ_DIR)/parallel.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# Standalone k-means program (for testing).
+$(KMEANSPAR): $(OBJ_DIR)/kmeans-standalone.o $(OBJ_DIR)/parallel.o
+	$(CC) $(LDFLAGS) -o $@ $^
+
+# Pattern rule: compile any mathserver/src/X.c into mathserver/objects/X.o.
+# '| $(OBJ_DIR)' = the folder must exist first (but its timestamp is ignored).
+$(OBJ_DIR)/%.o: $(SRC_DIR)/%.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -c -o $@ $<
+
+# Same source file compiled again with -DMATINV_STANDALONE, which switches on its main().
+$(OBJ_DIR)/matinv-standalone.o: $(SRC_DIR)/matinv-par.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DMATINV_STANDALONE -c -o $@ $<
+
+# Same idea for k-means: -DKMEANS_STANDALONE switches on its main().
+$(OBJ_DIR)/kmeans-standalone.o: $(SRC_DIR)/kmeans-par.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) $(DEPFLAGS) -DKMEANS_STANDALONE -c -o $@ $<
+
+# Create the objects folder if it is missing.
+$(OBJ_DIR):
+	mkdir -p $@
+
+# 'make clean' deletes everything the build produced.
+clean:
+	rm -f $(SERVER) $(CLIENT) $(MATINVPAR) $(KMEANSPAR) $(OBJ_DIR)/*.o $(OBJ_DIR)/*.d
+
+# 'all' and 'clean' are names of actions, not files that make should look for.
+.PHONY: all clean
+
+# Read the generated .d dependency files if they exist ('-' = no error if none yet).
+-include $(wildcard $(OBJ_DIR)/*.d)
+===== END OF FILE: lab2-solution/project/Makefile =====
+
+
+################################################################################
+# APPENDIX - TEST-ONLY REFERENCE PROGRAMS (not part of the submission)
+################################################################################
+
+[23] lab2-solution/tests/reference/matrix_inverse.c
+    About: Reconstruction of the course's sequential matrix_inverse.c, used
+           only by the tests to compare outputs. Use the real Canvas file when
+           you have it.
+
+===== FILE: lab2-solution/tests/reference/matrix_inverse.c =====
+/*
+ * RECONSTRUCTION FOR TESTING ONLY - not the course file.
+ *
+ * Sequential matrix inversion written to behave like the matrix_inverse.c
+ * handed out on Canvas, as far as the lab handout shows (options, defaults,
+ * matrix initialisation and the " %5.2f" output, e.g. the -n 4 -I fast
+ * example in the handout). Replace it with the real Canvas file when you
+ * compare: run_tests.sh accepts SEQ_DIR=/path/to/canvas/files.
+ */
+#include <assert.h> // assert(): stops the program if a condition is false
+#include <stdio.h>  // printf()
+#include <stdlib.h> // atoi(), rand(), exit()
+#include <string.h> // strcmp()
+
+#define MAX_SIZE 4096 // largest matrix the fixed-size arrays can hold
+
+typedef double matrix[MAX_SIZE][MAX_SIZE]; // a MAX_SIZE x MAX_SIZE matrix type
+
+int N;            // the matrix size actually used (-n)
+int maxnum;       // bound for random entries (-m)
+char *Init;       // "fast" or "rand" (-I)
+int PRINT;        // 1 = print the inverse (-P)
+matrix A;         // the input matrix (global: too big for the stack)
+matrix I = { 0.0 }; // becomes the inverse; starts all zero
+
+void find_inverse(void);                // forward declarations: the functions
+void Init_Matrix(void);                 // are defined further down
+void Print_Matrix(matrix M, char name[]);
+void Init_Default(void);
+int Read_Options(int, char **);
+
+int main(int argc, char **argv)
+{
+    printf("Matrix Inverse\n"); // title
+    Init_Default();             // default option values
+    Read_Options(argc, argv);   // override them from the command line
+    Init_Matrix();              // fill A, set I to the identity
+    find_inverse();             // Gauss-Jordan elimination
+    if (PRINT == 1)
+        Print_Matrix(I, "Inversed");
+    return 0;
+}
+
+/* Gauss-Jordan: turn A into the identity; the same row operations turn I
+   into the inverse of the original A. */
+void find_inverse(void)
+{
+    int row, col, p; // p = the current pivot row/column
+    double pivalue;  // the pivot value A[p][p]
+
+    for (p = 0; p < N; p++) { // every pivot, in order
+        pivalue = A[p][p];
+        for (col = 0; col < N; col++) { // divide the pivot row by the pivot
+            A[p][col] = A[p][col] / pivalue;
+            I[p][col] = I[p][col] / pivalue;
+        }
+        assert(A[p][p] == 1.0); // the pivot is now exactly 1
+
+        double multiplier;
+        for (row = 0; row < N; row++) { // every other row...
+            multiplier = A[row][p];
+            if (row != p) {
+                for (col = 0; col < N; col++) { // ...minus multiplier * pivot row
+                    A[row][col] = A[row][col] - A[p][col] * multiplier;
+                    I[row][col] = I[row][col] - I[p][col] * multiplier;
+                }
+                assert(A[row][p] == 0.0); // column p is now 0 outside the pivot
+            }
+        }
+    }
+}
+
+/* Prints the header lines and fills the matrices. */
+void Init_Matrix(void)
+{
+    int row, col;
+
+    for (row = 0; row < N; row++)  // I = identity matrix
+        for (col = 0; col < N; col++)
+            if (row == col)
+                I[row][col] = 1.0;
+
+    printf("\nsize      = %dx%d ", N, N);
+    printf("\nmaxnum    = %d \n", maxnum);
+    printf("Init\t  = %s \n", Init);
+    printf("Initializing matrix...");
+
+    if (strcmp(Init, "rand") == 0) { // random entries, larger on the diagonal
+        for (row = 0; row < N; row++)
+            for (col = 0; col < N; col++) {
+                if (row == col)
+                    A[row][col] = (double)(rand() % maxnum) + 5.0;
+                else
+                    A[row][col] = (double)(rand() % maxnum) + 1.0;
+            }
+    }
+    if (strcmp(Init, "fast") == 0) { // fixed entries: 5 on the diagonal, 2 elsewhere
+        for (row = 0; row < N; row++)
+            for (col = 0; col < N; col++) {
+                if (row == col)
+                    A[row][col] = 5.0;
+                else
+                    A[row][col] = 2.0;
+            }
+    }
+    printf("done \n\n");
+}
+
+/* Prints a matrix with the title "<name> Matrix:". */
+void Print_Matrix(matrix M, char name[])
+{
+    int row, col;
+
+    printf("%s Matrix:\n", name);
+    for (row = 0; row < N; row++) {
+        for (col = 0; col < N; col++)
+            printf(" %5.2f", M[row][col]); // width 5, 2 decimals
+        printf("\n");
+    }
+    printf("\n\n");
+}
+
+void Init_Default(void)
+{
+    N = 5;          // 5 x 5
+    Init = "fast";
+    maxnum = 15.0;  // (assigned to an int: 15)
+    PRINT = 1;
+}
+
+/* Hand-written option parser: looks at the first letter after each '-'. */
+int Read_Options(int argc, char **argv)
+{
+    char *prog = *argv; // program name, for messages
+
+    while (++argv, --argc > 0) // step through the words after the program name
+        if (**argv == '-')     // an option
+            switch (*++*argv) { // the letter after the '-'
+            case 'n':
+                --argc;
+                N = atoi(*++argv); // the next word is the size
+                break;
+            case 'h':
+                printf("\nHELP: try matinv -u \n\n");
+                exit(0);
+            case 'u':
+                printf("\nUsage: matinv [-n problemsize]\n");
+                printf("           [-D] show default values \n");
+                printf("           [-h] help \n");
+                printf("           [-I init_type] fast/rand \n");
+                printf("           [-m maxnum] max random no \n");
+                printf("           [-P print_switch] 0/1 \n");
+                exit(0);
+            case 'D':
+                printf("\nDefault:  n         = %d ", N);
+                printf("\n          Init      = rand");
+                printf("\n          maxnum    = 5 ");
+                printf("\n          P         = 0 \n\n");
+                exit(0);
+            case 'I':
+                --argc;
+                Init = *++argv; // the next word is the init type
+                break;
+            case 'm':
+                --argc;
+                maxnum = atoi(*++argv);
+                break;
+            case 'P':
+                --argc;
+                PRINT = atoi(*++argv);
+                break;
+            default:
+                printf("%s: ignored option: -%s\n", prog, *argv);
+                printf("HELP: try %s -u \n\n", prog);
+                break;
+            }
+    return 0;
+}
+===== END OF FILE: lab2-solution/tests/reference/matrix_inverse.c =====
+
+[24] lab2-solution/tests/reference/kmeans.c
+    About: Reconstruction of the course's sequential kmeans.c, used only by
+           the tests. Use the real Canvas file when you have it.
+
+===== FILE: lab2-solution/tests/reference/kmeans.c =====
+/*
+ * RECONSTRUCTION FOR TESTING ONLY - not the course file.
+ *
+ * Sequential k-means written to behave like the kmeans.c handed out on
+ * Canvas, as far as the lab handout shows (fixed input kmeans-data.txt,
+ * k = 9, output kmeans-results.txt, the four progress messages). Replace it
+ * with the real Canvas file when you compare: run_tests.sh accepts
+ * SEQ_DIR=/path/to/canvas/files.
+ */
+#include <float.h>   // floating-point limits
+#include <limits.h>  // INT_MAX
+#include <stdbool.h> // bool, true, false
+#include <stdio.h>   // printf(), fopen(), fscanf(), fprintf()
+#include <stdlib.h>  // rand(), srand(), exit()
+
+#define MAX_POINTS 4096  // fixed array sizes
+#define MAX_CLUSTERS 32
+
+typedef struct point {
+    float x;     // coordinates
+    float y;
+    int cluster; // assigned cluster, -1 = none yet
+} point;
+
+int N;                         // number of points (fixed at 1797)
+int k;                         // number of clusters (fixed at 9)
+point data[MAX_POINTS];        // the data points
+point cluster[MAX_CLUSTERS];   // the centroids (only x and y are used)
+
+/* Reads exactly N points from kmeans-data.txt and picks k random centroids. */
+void read_data(void)
+{
+    N = 1797;
+    k = 9;
+    FILE *fp = fopen("kmeans-data.txt", "r");
+    if (fp == NULL) {
+        perror("Cannot open the file");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < N; i++) {
+        if (fscanf(fp, "%f %f", &data[i].x, &data[i].y) != 2) { // one "x y" pair
+            fprintf(stderr, "Bad data\n");
+            exit(EXIT_FAILURE);
+        }
+        data[i].cluster = -1;
+    }
+    printf("Read the problem data!\n");
+    srand(0); // fixed seed: the same "random" centroids every run
+    for (int i = 0; i < k; i++) {
+        int r = rand() % N; // a random point index
+        cluster[i].x = data[r].x;
+        cluster[i].y = data[r].y;
+    }
+    fclose(fp);
+}
+
+/* Index of the centroid nearest to point i (ties go to the later one). */
+int get_closest_centroid(int i, int k)
+{
+    int nearest_cluster = -1;
+    double xdist, ydist, dist, min_dist;
+    min_dist = dist = INT_MAX; // "very far" to start with
+    for (int c = 0; c < k; c++) {
+        xdist = data[i].x - cluster[c].x;
+        ydist = data[i].y - cluster[c].y;
+        dist = xdist * xdist + ydist * ydist; // squared distance
+        if (dist <= min_dist) {
+            min_dist = dist;
+            nearest_cluster = c;
+        }
+    }
+    return nearest_cluster;
+}
+
+/* Assignment step: every point to its nearest centroid. True if any moved. */
+bool assign_clusters_to_points(void)
+{
+    bool something_changed = false;
+    for (int i = 0; i < N; i++) {
+        int old_cluster = data[i].cluster;
+        int new_cluster = get_closest_centroid(i, k);
+        data[i].cluster = new_cluster;
+        if (old_cluster != new_cluster)
+            something_changed = true;
+    }
+    return something_changed;
+}
+
+/* Update step: each centroid moves to the average of its points. */
+void update_cluster_centers(void)
+{
+    int count[MAX_CLUSTERS] = { 0 };                 // points per cluster
+    point temp[MAX_CLUSTERS] = { { 0.0f, 0.0f, 0 } }; // coordinate sums per cluster
+
+    for (int i = 0; i < N; i++) {
+        int c = data[i].cluster;
+        count[c]++;
+        temp[c].x += data[i].x;
+        temp[c].y += data[i].y;
+    }
+    for (int i = 0; i < k; i++) {
+        cluster[i].x = temp[i].x / count[i];
+        cluster[i].y = temp[i].y / count[i];
+    }
+}
+
+/* Repeats assignment + update until no point changes cluster. */
+void kmeans(void)
+{
+    bool somechange;
+    int iter = 0;
+    do {
+        iter++;
+        somechange = assign_clusters_to_points();
+        update_cluster_centers();
+    } while (somechange);
+    printf("Number of iterations taken = %d\n", iter);
+    printf("Computed cluster numbers successfully!\n");
+}
+
+/* Writes "x y cluster" for every point to kmeans-results.txt. */
+void write_results(void)
+{
+    FILE *fp = fopen("kmeans-results.txt", "w");
+    if (fp == NULL) {
+        perror("Cannot open the file");
+        exit(EXIT_FAILURE);
+    }
+    for (int i = 0; i < N; i++)
+        fprintf(fp, "%.2f %.2f %d\n", data[i].x, data[i].y, data[i].cluster);
+    fclose(fp);
+    printf("Wrote the results to a file!\n");
+}
+
+int main(void)
+{
+    read_data();
+    kmeans();
+    write_results();
+    return 0;
+}
+===== END OF FILE: lab2-solution/tests/reference/kmeans.c =====
+
